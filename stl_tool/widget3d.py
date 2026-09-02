@@ -1,5 +1,6 @@
 import numpy as np
 import pyqtgraph.opengl as gl
+from pyqtgraph.opengl.shaders import FragmentShader, ShaderProgram, VertexShader
 from PyQt6 import QtWidgets
 from PyQt6.QtCore import Qt as QtCoreQt
 
@@ -11,6 +12,46 @@ def boundary_edges_of(mesh):
     sorted_edges = np.sort(edges, axis=1)
     _, idx, counts = np.unique(sorted_edges, axis=0, return_index=True, return_counts=True)
     return edges[idx[counts == 1]]
+
+
+_CAD_VERT = """
+uniform mat4 u_mvp;
+uniform mat3 u_normal;
+attribute vec4 a_position;
+attribute vec3 a_normal;
+attribute vec4 a_color;
+varying vec4 v_color;
+varying vec3 v_normal;
+void main() {
+    v_normal = normalize(u_normal * a_normal);
+    v_color = a_color;
+    gl_Position = u_mvp * a_position;
+}
+"""
+
+_CAD_FRAG = """
+#ifdef GL_ES
+precision mediump float;
+#endif
+varying vec4 v_color;
+varying vec3 v_normal;
+void main() {
+    vec3 n = normalize(v_normal);
+    /* 光源从左上角方向照下 */
+    float d = dot(n, normalize(vec3(-1.0, 1.0, 1.0)));
+    float p = max(d, 0.0);
+    /* 环境光 0.45 + 漫反射 */
+    float light = 0.45 + 0.55 * p;
+    gl_FragColor = vec4(v_color.rgb * light, v_color.a);
+}
+"""
+
+
+def _cad_shader():
+    return ShaderProgram(
+        "cad",
+        [VertexShader(_CAD_VERT), FragmentShader(_CAD_FRAG)],
+    )
 
 
 class GLCADViewWidget(QtWidgets.QWidget):
@@ -85,9 +126,10 @@ class GLCADViewWidget(QtWidgets.QWidget):
         self.mesh_item = gl.GLMeshItem(
             meshdata=meshdata,
             smooth=False,
-            shader="shaded",
+            shader=None,
             glOptions="opaque",
         )
+        self.mesh_item.setShader(_cad_shader())
         self.view.addItem(self.mesh_item)
 
         if show_boundary and not mesh.is_watertight and len(boundary_edges_of(mesh)) > 0:

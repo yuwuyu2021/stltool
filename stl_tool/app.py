@@ -163,7 +163,7 @@ class MainWindow(QMainWindow):
 
         color_row = QHBoxLayout()
         color_row.addWidget(QLabel("模型颜色"))
-        self.model_color = QColor(0x99, 0x9E, 0xA5)
+        self.model_color = QColor(0x55, 0xFF, 0x7F)
         self.btn_color = QPushButton()
         self.btn_color.setFixedWidth(120)
         self._apply_color_button_style()
