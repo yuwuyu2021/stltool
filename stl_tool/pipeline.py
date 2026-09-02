@@ -103,3 +103,47 @@ def make_compound(*shapes):
 def combine_shapes(result):
     shapes = [s for s, _ in result.shapes]
     return make_compound(*shapes) if shapes else None
+
+
+def shape_to_mesh(shape, linear_deflection=0.5, angular_deflection=0.5):
+    """将 OCC shape 三角离散为 trimesh 网格，供预览渲染。"""
+    import trimesh
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.Poly import Poly_Triangulation
+
+    if shape.IsNull():
+        return None
+    mesh = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
+    mesh.Perform()
+    if not mesh.IsDone():
+        return None
+
+    verts = []
+    faces = []
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        face = TopoDS.Face_s(exp.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None:
+            n_verts = tri.NbNodes()
+            base = len(verts)
+            for i in range(1, n_verts + 1):
+                p = tri.Node(i)
+                verts.append((p.X(), p.Y(), p.Z()))
+            for i in range(1, tri.NbTriangles() + 1):
+                t = tri.Triangle(i).Get()
+                n1, n2, n3 = t[0] - 1, t[1] - 1, t[2] - 1
+                faces.append((base + n1, base + n2, base + n3))
+        exp.Next()
+
+    if not verts or not faces:
+        return None
+    m = trimesh.Trimesh(vertices=np.asarray(verts, dtype=np.float64),
+                        faces=np.asarray(faces, dtype=np.int64))
+    return m

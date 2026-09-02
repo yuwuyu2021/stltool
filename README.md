@@ -37,7 +37,7 @@ python tests\test_core.py
 - `PyQt6` + `pyqtgraph` —— GUI 与 OpenGL 3D 预览
 
 ## 当前版本
-v0.2.0
+v0.0.3
 
 详见 `plan.md`。
 

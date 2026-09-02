@@ -4,18 +4,18 @@ import time
 import numpy as np
 import trimesh
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QKeySequence
+from PyQt6.QtGui import QAction, QColor, QFont, QKeySequence
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStatusBar,
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from . import APP_NAME, VERSION
-from .widget3d import GLMeshViewer
+from .widget3d import GLCADViewWidget
 from .mesh_analyzer import MeshAnalysis
-from .pipeline import analyze, convert, ConvertOptions
+from .pipeline import analyze, convert, ConvertOptions, make_compound, shape_to_mesh
 from .step_exporter import write_step
 
 
@@ -152,15 +152,41 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.btn_convert)
         lv.addWidget(self.btn_export)
 
+        btn_row = QHBoxLayout()
+        self.btn_preview = QPushButton("生成预览")
+        self.btn_reset = QPushButton("重置视图")
+        self.btn_preview.clicked.connect(self.on_preview)
+        self.btn_reset.clicked.connect(self.reset_all_views)
+        btn_row.addWidget(self.btn_preview)
+        btn_row.addWidget(self.btn_reset)
+        lv.addLayout(btn_row)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("模型颜色"))
+        self.model_color = QColor(0x99, 0x9E, 0xA5)
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedWidth(120)
+        self._apply_color_button_style()
+        self.btn_color.clicked.connect(self.pick_model_color)
+        color_row.addWidget(self.btn_color)
+        lv.addLayout(color_row)
+
         self.result_label = QLabel("")
         self.result_label.setWordWrap(True)
         self.result_label.setStyleSheet("color:#0a6;")
         lv.addWidget(self.result_label)
         lv.addStretch(1)
 
-        self.viewer = GLMeshViewer()
+        # 双预览窗口：STL 在上，STEP 在下
+        self.viewer_stl = GLCADViewWidget(title="STL 预览")
+        self.viewer_step = GLCADViewWidget(title="STEP 预览")
+        preview_splitter = QSplitter(Qt.Orientation.Vertical)
+        preview_splitter.addWidget(self.viewer_stl)
+        preview_splitter.addWidget(self.viewer_step)
+        preview_splitter.setStretchFactor(0, 1)
+        preview_splitter.setStretchFactor(1, 1)
         splitter.addWidget(left)
-        splitter.addWidget(self.viewer)
+        splitter.addWidget(preview_splitter)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([380, 900])
@@ -196,7 +222,7 @@ class MainWindow(QMainWindow):
 
         vm = m.addMenu("视图")
         a_reset = QAction("重置视角", self)
-        a_reset.triggered.connect(self.viewer.reset_view)
+        a_reset.triggered.connect(self.reset_all_views)
         vm.addAction(a_reset)
 
         hm = m.addMenu("帮助")
@@ -246,7 +272,7 @@ class MainWindow(QMainWindow):
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
         self.analysis_box.setPlainText("\n".join(self.analysis.summary_lines()))
-        self.viewer.set_mesh(mesh, show_boundary=True, show_bad_faces=True)
+        self.viewer_stl.set_mesh(mesh, show_boundary=True, show_bad_faces=True, color=self.model_rgba())
         self.result_label.setText("已加载：{} 顶点 / {} 面。自动分析完成，可执行转换。".format(
             len(mesh.vertices), len(mesh.faces)))
         self.log("打开 {}：{} 顶点 / {} 面 / 水密={}".format(
@@ -330,6 +356,7 @@ class MainWindow(QMainWindow):
             r.solid_count, r.shell_count, r.invalid_count))
         lines.append(r.message)
         self.analysis_box.setPlainText("\n".join(lines))
+        self._show_step_preview(r)
         out = report.get("output")
         if out:
             if out["ok"]:
@@ -354,6 +381,69 @@ class MainWindow(QMainWindow):
         self.result_label.setText("发生错误：{}".format(msg))
         self.log("错误：" + msg)
         QMessageBox.critical(self, "错误", msg)
+
+    def _show_step_preview(self, result):
+        try:
+            shapes = [s for s, v in result.shapes]
+            shape = make_compound(*shapes) if shapes else None
+            if shape is None:
+                self.viewer_step.clear()
+                return
+            mesh = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
+            if mesh is not None:
+                self.step_preview_mesh = mesh
+                self.viewer_step.set_mesh(mesh, show_boundary=False, show_bad_faces=False,
+                                          color=self.model_rgba())
+                self.result_label.setText("STEP 预览已更新")
+            else:
+                self.step_preview_mesh = None
+                self.viewer_step.clear()
+        except Exception as exc:
+            self.viewer_step.clear()
+            self.log("STEP 预览失败：" + str(exc))
+
+    def reset_all_views(self):
+        self.viewer_stl.reset_view()
+        self.viewer_step.reset_view()
+
+    def on_preview(self):
+        if self.mesh is None:
+            QMessageBox.information(self, "提示", "请先打开一个 STL 文件。")
+            return
+        # 刷新 STL 预览并自动居中
+        self.viewer_stl.set_mesh(self.mesh, show_boundary=True, show_bad_faces=True,
+                                 color=self.model_rgba())
+        self.viewer_stl.reset_view()
+        self.log("已刷新 STL 预览。")
+
+    def model_rgba(self):
+        c = self.model_color
+        return (c.red() / 255.0, c.green() / 255.0, c.blue() / 255.0, 1.0)
+
+    def _apply_color_button_style(self):
+        c = self.model_color.name()
+        text_color = "#000" if self.model_color.lightness() > 128 else "#fff"
+        self.btn_color.setText(self.model_color.name())
+        self.btn_color.setStyleSheet(
+            "background:{}; color:{}; border:1px solid #bbb;".format(c, text_color)
+        )
+
+    def pick_model_color(self):
+        color = QColorDialog.getColor(self.model_color, self, "选择模型颜色")
+        if color.isValid():
+            self.model_color = color
+            self._apply_color_button_style()
+            if self.mesh is not None:
+                self.apply_model_color()
+            self.log("模型颜色已设为 {}".format(self.model_color.name()))
+
+    def apply_model_color(self):
+        if self.viewer_stl.mesh_item is not None:
+            self.viewer_stl.set_mesh(self.mesh, show_boundary=True, show_bad_faces=True,
+                                     color=self.model_rgba())
+        if self.viewer_step.mesh_item is not None:
+            self.viewer_step.set_mesh(self.step_preview_mesh, show_boundary=False, show_bad_faces=False,
+                                      color=self.model_rgba())
 
     def show_about(self):
         QMessageBox.about(self, "关于 " + APP_NAME,
