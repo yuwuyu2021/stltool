@@ -4,7 +4,13 @@ __pycache__/
 .venv/
 dist/
 build/
+dist_min/
+build_min/
+assets/
+_diag/
 *.step
 *.stp
 !tests/fixtures/*.step
+Block26*.stl
+!tests/fixtures/*.stl
 .DS_Store
