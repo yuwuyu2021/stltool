@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+*.step
+*.stp
+!tests/fixtures/*.step
+.DS_Store
