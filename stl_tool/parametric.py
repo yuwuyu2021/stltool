@@ -557,21 +557,38 @@ def _loop_rdp(loop2d, eps):
     return out
 
 
-def _extrude_solid(poly2d, basis, origin, height_vec, tol=1e-5, rdp_eps=0.2):
+def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
+                   tol=1e-5, rdp_eps=0.2):
     """由 2D 多边形（外环+孔）挤出成实体。
 
     poly2d:    shapely 多边形（位于 uv 平面）
     basis:     (2,3) 正交基，uv→世界
     origin:    底面原点（世界坐标）
     height_vec: 挤出向量（世界坐标，长度=板厚，方向朝内表面）
+    plane_normal: 底面法向（世界坐标单位向量）；用于圆孔圆柱朝向，None 时由 height_vec 推断
     返回 OCP shape 或 None。
     """
-    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax2
     from OCP.BRepBuilderAPI import (
         BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace,
     )
-    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism, BRepPrimAPI_MakeCylinder
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+
+    if plane_normal is None:
+        plane_normal = np.asarray(height_vec, dtype=np.float64)
+        nrm_len = np.linalg.norm(plane_normal)
+        if nrm_len > 1e-12:
+            plane_normal = plane_normal / nrm_len
+        else:
+            plane_normal = np.array([0.0, 0.0, 1.0])
+    plane_normal = np.asarray(plane_normal, dtype=np.float64)
+    plane_normal = plane_normal / np.linalg.norm(plane_normal)
+    drill_dir = plane_normal.copy()
+    # 圆柱钻孔方向须与挤出方向一致（进实体内部），否则会朝外长不切除
+    hv = np.asarray(height_vec, dtype=np.float64)
+    if np.dot(drill_dir, hv) < 0:
+        drill_dir = -drill_dir
 
     def wire3d(loop):
         pts = np.asarray(loop, dtype=np.float64)
@@ -606,6 +623,56 @@ def _extrude_solid(poly2d, basis, origin, height_vec, tol=1e-5, rdp_eps=0.2):
             return None
         return f.Face()
 
+    def hole_is_circle(inner, min_d=1.5, max_ratio=1.05, area_ok=0.99):
+        """判定孔是否近似圆并通过面积一致性。返回 (cx, cy, r) 或 None。
+
+        - bbox 宽高比 ≤ max_ratio（排除长条/异形）
+        - 环围成 Polygon 面积 vs πr² 一致性 ≥ area_ok（只接受真圆）
+        半径用 bbox 平均（对真圆即精确半径）。
+        """
+        import shapely.geometry as sg
+        pts = np.asarray(inner.coords, dtype=np.float64)
+        if len(pts) < 6:
+            return None
+        x, y = pts[:, 0], pts[:, 1]
+        bw = x.max() - x.min()
+        bh = y.max() - y.min()
+        dmin = min(bw, bh)
+        dmax = max(bw, bh)
+        if dmin < min_d or dmax / dmin > max_ratio:
+            return None
+        cx, cy = (x.min() + x.max()) / 2.0, (y.min() + y.max()) / 2.0
+        r = (dmin + dmax) / 4.0
+        if r <= 0:
+            return None
+        try:
+            ring = sg.Polygon(pts)
+            ring_area = abs(ring.area)
+        except Exception:
+            ring_area = 0.0
+        if ring_area <= 0 or ring_area / (np.pi * r * r) < area_ok:
+            return None
+        return (cx, cy, r)
+
+    def make_hole_cut(inner):
+        """构造孔切除体：圆孔用解析圆柱，其他用挤出多边形。返回 shape 或 None。"""
+        circ = hole_is_circle(inner)
+        if circ is not None:
+            cx, cy, r = circ
+            c3 = origin + basis[0] * cx + basis[1] * cy
+            hlen = float(np.linalg.norm(height_vec))
+            # 圆柱从底面沿法向拉伸到板厚，稍超界确保贯穿
+            cyl = BRepPrimAPI_MakeCylinder(
+                gp_Ax2(gp_Pnt(*c3), gp_Dir(*drill_dir)), r, hlen + 2.0 * tol)
+            return cyl.Shape()
+        loop = list(inner.coords)
+        if loop[0] == loop[-1]:
+            loop = loop[:-1]
+        f2 = face_of(loop)
+        if f2 is None:
+            return None
+        return BRepPrimAPI_MakePrism(f2, gp_Vec(*height_vec)).Shape()
+
     outer_loop = list(poly2d.exterior.coords)
     if outer_loop[0] == outer_loop[-1]:
         outer_loop = outer_loop[:-1]
@@ -614,15 +681,14 @@ def _extrude_solid(poly2d, basis, origin, height_vec, tol=1e-5, rdp_eps=0.2):
         return None
     solid = BRepPrimAPI_MakePrism(f, gp_Vec(*height_vec)).Shape()
 
+    n_circ = 0
     for inner in poly2d.interiors:
         try:
-            loop = list(inner.coords)
-            if loop[0] == loop[-1]:
-                loop = loop[:-1]
-            f2 = face_of(loop)
-            if f2 is None:
+            hole = make_hole_cut(inner)
+            if hole is None:
                 continue
-            hole = BRepPrimAPI_MakePrism(f2, gp_Vec(*height_vec)).Shape()
+            if hole_is_circle(inner) is not None:
+                n_circ += 1
             cut = BRepAlgoAPI_Cut(solid, hole)
             if cut.IsDone():
                 solid = cut.Shape()
@@ -702,7 +768,7 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     origin = basis[0] * c[0] + basis[1] * c[1] + axis * z_base
     height_vec = axis * (z_other - z_surf)
 
-    solid = _extrude_solid(poly, basis, origin, height_vec)
+    solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n)
     if solid is None:
         return None, None
 
