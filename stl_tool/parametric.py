@@ -592,15 +592,68 @@ def hole_is_circle(inner, min_d=1.5, max_ratio=1.05, area_ok=0.99):
         return (cx, cy, r)
 
 
+def hole_is_obround(inner, min_d=1.5, rms_ok=0.30, area_ok=0.90):
+    """判定孔是否近似腰型（两条平行直边 + 两端同半径圆弧）。
+
+    返回 (cx, cy, u0, u1, d, r) 或 None：
+      cx,cy  环点均值（uv 坐标）
+      u0,u1  长轴单位向量（uv 平面内）
+      d      两圆弧圆心距；r 圆弧半径
+    判据：PCA 长轴下，点到"两直段 + 两圆弧"边界曲线距离的均方根 ≤ rms_ok*r、
+    腰型面积 vs 环面积一致性 ≥ area_ok。
+    """
+    pts = np.asarray(inner.coords, dtype=np.float64)
+    if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    if len(pts) < 8:
+        return None
+    center = pts.mean(axis=0)
+    m = pts - center
+    cov = (m.T @ m) / len(m)
+    vals, vecs = np.linalg.eigh(cov)
+    u = vecs[:, int(np.argmax(vals))]          # 长轴
+    v = np.array([-u[1], u[0]])               # 短轴
+    x, y = m @ u, m @ v
+    r = float((y.max() - y.min()) / 2.0)
+    d = float((x.max() - x.min()) - 2.0 * r)  # 两圆心距
+    if r < min_d or d < 0.5:
+        return None
+    half = d / 2.0
+    # 点到边界曲线的最短距离：两直段 + 两圆弧
+    d_top = np.where((x >= -half) & (x <= half), np.abs(y - r),
+                     np.minimum(np.hypot(x + half, y - r),
+                                np.hypot(x - half, y - r)))
+    d_bot = np.where((x >= -half) & (x <= half), np.abs(y + r),
+                     np.minimum(np.hypot(x + half, y + r),
+                                np.hypot(x - half, y + r)))
+    d_rt = np.abs(np.hypot(x - half, y) - r)
+    d_lt = np.abs(np.hypot(x + half, y) - r)
+    bdist = np.minimum(np.minimum(d_top, d_bot), np.minimum(d_rt, d_lt))
+    if np.sqrt(np.mean(bdist ** 2)) > rms_ok * r:
+        return None
+    a_ob = 2.0 * r * d + np.pi * r * r
+    try:
+        import shapely.geometry as sg
+        a_ring = abs(sg.Polygon(pts).area)
+    except Exception:
+        a_ring = 0.0
+    if a_ring <= 0 or abs(a_ob - a_ring) / a_ring > (1.0 - area_ok):
+        return None
+    return (float(center[0]), float(center[1]),
+            float(u[0]), float(u[1]), d, r)
+
+
 def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
-                   tol=1e-5, rdp_eps=0.2):
+                   tol=1e-5, rdp_eps=0.2, stats=None):
     """由 2D 多边形（外环+孔）挤出成实体。
 
-    poly2d:    shapely 多边形（位于 uv 平面)）
+    poly2d:    shapely 多边形（位于 uv 平面）
     basis:     (2,3) 正交基，uv→世界
-    origin:    底面原点（世界坐标）
+    origin:    底面原点（世界坐标。uv 坐标是世界原点投影的绝对坐标，
+               故 origin 应只含 z 位移，勿叠加 uv centroid）
     height_vec: 挤出向量（世界坐标，长度=板厚，方向朝内表面）
     plane_normal: 底面法向（世界坐标单位向量）；用于圆孔圆柱朝向，None 时由 height_vec 推断
+    stats:     可选 dict，累积 n_circ / n_ob（实际采用的解析孔计数）
     返回 OCP shape 或 None。
     """
     from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax2
@@ -658,8 +711,53 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
             return None
         return f.Face()
 
+    def make_obround_cut(ob):
+        """腰型孔：两直边 + 两端圆弧的解析面切除体。返回 shape 或 None。"""
+        cx, cy, u0, u1, dd, rr = ob
+        ud = np.array([u0, u1])
+        vd = np.array([-u1, u0])
+        ctr = np.array([cx, cy])
+        LT = ctr - ud * (dd / 2.0) + vd * rr
+        RT = ctr + ud * (dd / 2.0) + vd * rr
+        LB = ctr - ud * (dd / 2.0) - vd * rr
+        RB = ctr + ud * (dd / 2.0) - vd * rr
+
+        def W(p):
+            return (origin[0] + basis[0][0] * p[0] + basis[1][0] * p[1],
+                    origin[1] + basis[0][1] * p[0] + basis[1][1] * p[1],
+                    origin[2] + basis[0][2] * p[0] + basis[1][2] * p[1])
+
+        try:
+            from OCP.gp import gp_Circ
+            nrm = gp_Dir(*drill_dir)
+            c_rt = ctr + ud * (dd / 2.0)
+            c_lt = ctr - ud * (dd / 2.0)
+            circ_rt = gp_Circ(gp_Ax2(gp_Pnt(*W(c_rt)), nrm), rr)
+            circ_lt = gp_Circ(gp_Ax2(gp_Pnt(*W(c_lt)), nrm), rr)
+            e_top = BRepBuilderAPI_MakeEdge(gp_Pnt(*W(LT)), gp_Pnt(*W(RT)))
+            # 圆弧为圆上 P1→P2 参数增大方向（CCW）的一段：
+            # 右圆 +u 方向突出，需自下端点 (270°) 增大→穿过 0° 到上端点 (90°)；
+            # 左圆 -u 方向突出，需自上端点 (90°) 增大→穿过 180° 到下端点 (270°)。
+            e_rt = BRepBuilderAPI_MakeEdge(circ_rt, gp_Pnt(*W(RB)), gp_Pnt(*W(RT)))
+            e_bot = BRepBuilderAPI_MakeEdge(gp_Pnt(*W(RB)), gp_Pnt(*W(LB)))
+            e_lt = BRepBuilderAPI_MakeEdge(circ_lt, gp_Pnt(*W(LT)), gp_Pnt(*W(LB)))
+            mw = BRepBuilderAPI_MakeWire()
+            for e in (e_top, e_rt, e_bot, e_lt):
+                if not e.IsDone():
+                    return None
+                mw.Add(e.Edge())
+            if not mw.IsDone():
+                return None
+            f = BRepBuilderAPI_MakeFace(mw.Wire(), True)
+            if not f.IsDone():
+                return None
+            return BRepPrimAPI_MakePrism(f.Face(), gp_Vec(*height_vec)).Shape()
+        except Exception:
+            return None
+
     def make_hole_cut(inner):
-        """构造孔切除体：圆孔用解析圆柱，其他用挤出多边形。返回 shape 或 None。"""
+        """构造孔切除体：圆孔用解析圆柱，腰型孔用解析圆弧+直边，其余挤出
+        多边形。返回 shape 或 None。"""
         circ = hole_is_circle(inner)
         if circ is not None:
             cx, cy, r = circ
@@ -669,6 +767,11 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
             cyl = BRepPrimAPI_MakeCylinder(
                 gp_Ax2(gp_Pnt(*c3), gp_Dir(*drill_dir)), r, hlen + 2.0 * tol)
             return cyl.Shape()
+        ob = hole_is_obround(inner)
+        if ob is not None:
+            ob_s = make_obround_cut(ob)
+            if ob_s is not None:
+                return ob_s
         loop = list(inner.coords)
         if loop[0] == loop[-1]:
             loop = loop[:-1]
@@ -686,18 +789,29 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
     solid = BRepPrimAPI_MakePrism(f, gp_Vec(*height_vec)).Shape()
 
     n_circ = 0
+    n_ob = 0
     for inner in poly2d.interiors:
         try:
+            kind = None
+            if hole_is_circle(inner) is not None:
+                kind = "circle"
+            elif hole_is_obround(inner) is not None:
+                kind = "obround"
             hole = make_hole_cut(inner)
             if hole is None:
                 continue
-            if hole_is_circle(inner) is not None:
+            if kind == "circle":
                 n_circ += 1
+            elif kind == "obround":
+                n_ob += 1
             cut = BRepAlgoAPI_Cut(solid, hole)
             if cut.IsDone():
                 solid = cut.Shape()
         except Exception:
             continue
+    if stats is not None:
+        stats["n_circ"] = n_circ
+        stats["n_ob"] = n_ob
     if not _valid(solid):
         return None
     return solid
@@ -799,13 +913,17 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
 
     c = np.array(poly.centroid.coords[0], dtype=np.float64)
     z_base = z_surf if z_other > z_surf else z_surf - thickness
-    origin = basis[0] * c[0] + basis[1] * c[1] + axis * z_base
+    # uv 原点的世界位置（孔环/外环为世界原点投影的绝对 uv；基准面过世界
+    # 原点，故仅需 z 偏移；不可叠加 centroid c，否则整体被平移 +c）
+    origin = axis * z_base
     height_vec = axis * (z_other - z_surf)
     drill_axis = axis.copy()
     if np.dot(drill_axis, height_vec) < 0:
         drill_axis = -drill_axis
 
-    solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n)
+    stats = {}
+    solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n,
+                           stats=stats)
     if solid is None:
         return None, None
 
@@ -869,6 +987,8 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         "thickness": float(thickness),
         "area": float(poly.area),
         "counterbores": n_cb,
+        "circles": stats.get("n_circ", 0),
+        "obrounds": stats.get("n_ob", 0),
     }
     return solid, info
 

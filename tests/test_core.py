@@ -331,6 +331,56 @@ def test_convert_parametric_counterbore():
             "体积误差 {:.1%}".format((sv - mesh.volume) / mesh.volume)
 
 
+def test_convert_parametric_obround():
+    """腰型孔板：两条平行边+两端圆弧，重建出解析圆弧端面且体积近似。"""
+    from stl_tool.parametric import _volume
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+
+    # 60x40 板，深 4，中心 (30,20) 腰型孔 r=4、圆心距 24
+    def obround_poly(cx, cy, r, d):
+        c1 = sg.Point(cx - d / 2.0, cy).buffer(r, resolution=32)
+        c2 = sg.Point(cx + d / 2.0, cy).buffer(r, resolution=32)
+        rect = sg.box(cx - d / 2.0, cy - r, cx + d / 2.0, cy + r)
+        return unary_union([c1, c2, rect])
+
+    poly = sg.box(0, 0, 60, 40).difference(obround_poly(30, 20, 4, 24))
+    mesh = trimesh.creation.extrude_polygon(poly, 4)
+    assert mesh.is_watertight
+
+    from stl_tool.pipeline import prepare_mesh, ConvertOptions, convert
+    mesh, _ = prepare_mesh(mesh)
+    opts = ConvertOptions()
+    opts.parametric = True
+    opts.tolerance = 1e-4
+    r = convert(mesh, opts)
+    assert r.solid_count == 1, r.message
+    assert getattr(r, "param_type", None) == "plate", r.message
+
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    n = 0
+    n_cyl = 0
+    for s, v in r.shapes:
+        e = TopExp_Explorer(s, TopAbs_FACE)
+        while e.More():
+            n += 1
+            if BRepAdaptor_Surface(TopoDS.Face_s(e.Current())).GetType() == GeomAbs_Cylinder:
+                n_cyl += 1
+            e.Next()
+    assert n < len(mesh.faces) / 10, "面数 {} 应远低于原 {}".format(n, len(mesh.faces))
+    assert n_cyl == 2, "应有 2 个解析圆柱端面，实际 {}".format(n_cyl)
+    shapes = [s for s, v in r.shapes if v]
+    comp = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
+    sv = _volume(comp) if comp is not None else None
+    if sv is not None:
+        assert abs(sv - mesh.volume) / mesh.volume < 0.15, \
+            "体积误差 {:.1%}".format((sv - mesh.volume) / mesh.volume)
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
@@ -356,4 +406,6 @@ if __name__ == "__main__":
     print("parametric-plate ok")
     test_convert_parametric_counterbore()
     print("counterbore ok")
+    test_convert_parametric_obround()
+    print("obround ok")
     print("ALL TESTS PASSED")
