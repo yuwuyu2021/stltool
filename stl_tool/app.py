@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 from . import APP_NAME, VERSION
 from .widget3d import GLCADViewWidget
 from .mesh_analyzer import MeshAnalysis
+from .mesh_editor import rotate as mesh_rotate, mirror as mesh_mirror, merge_coplanar, orient_outward
 from .pipeline import analyze, convert, ConvertOptions, make_compound, shape_to_mesh
 from .step_exporter import write_step
 
@@ -33,27 +34,38 @@ class ConvertWorker(QThread):
         self.write_pcurves = write_pcurves
 
     def run(self):
+        import tempfile
+
         try:
             result = convert(self.mesh, self.options, progress_cb=self._progress)
+            # 总是导出一份真实 STEP 文件（转换时用临时文件，导出时用目标路径）
+            step_path = self.output_path
+            delete_after = False
+            shape = None
+            for s, valid in result.shapes:
+                if valid:
+                    shape = combine_here([s for s, v in result.shapes if v])
+                    break
+            if shape is None:
+                shape = combine_here([s for s, _ in result.shapes])
+            if shape is None:
+                raise RuntimeError("没有任何可用于导出的形状。")
+            if step_path is None:
+                fd, step_path = tempfile.mkstemp(suffix=".step")
+                os.close(fd)
+                delete_after = True
+            ok, msg = write_step(shape, step_path, schema=self.schema, write_pcurves=self.write_pcurves)
+            if not ok:
+                raise RuntimeError(msg)
             report = {
                 "result": result,
                 "analysis_lines": result.analysis.summary_lines(),
                 "prep_notes": result.prep_notes,
                 "options": self.options.as_dict(),
-                "output": None,
+                "step_path": step_path,
+                "delete_after": delete_after,
+                "output_path": self.output_path,
             }
-            if self.output_path:
-                shape = None
-                for s, valid in result.shapes:
-                    if valid:
-                        shape = combine_here([s for s, v in result.shapes if v])
-                        break
-                if shape is None:
-                    shape = combine_here([s for s, _ in result.shapes])
-                if shape is None:
-                    raise RuntimeError("没有任何可用于导出的形状。")
-                ok, msg = write_step(shape, self.output_path, schema=self.schema, write_pcurves=self.write_pcurves)
-                report["output"] = {"path": self.output_path, "ok": ok, "msg": msg}
             self.done.emit(report)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -82,9 +94,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.mesh = None
+        self.base_mesh = None
         self.analysis = None
         self.worker = None
         self.busy = False
+        self.current_step_path = None
+        self.step_preview_mesh = None
+        self.selected_faces = set()
+        self.stl_pick_verts = None
         self.setWindowTitle("{} v{}".format(APP_NAME, VERSION))
         self.resize(1280, 800)
         self._build_ui()
@@ -136,6 +153,84 @@ class MainWindow(QMainWindow):
         cv.addLayout(tol_row)
         lv.addWidget(conv_grp)
 
+        edit_grp = QGroupBox("STL 编辑（旋转/镜像/共面合并）")
+        ee = QVBoxLayout(edit_grp)
+        self.face_count_label = QLabel("面片数：—")
+        self.face_count_label.setStyleSheet("font-weight:bold; color:#333;")
+        ee.addWidget(self.face_count_label)
+        rot_lab = QLabel("旋转 90°")
+        rot_lab.setStyleSheet("color:#666; font-size:11px;")
+        ee.addWidget(rot_lab)
+        for axis, lab, sign in (("x", "X", 1), ("y", "Y", 1), ("z", "Z", 1)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(lab))
+            row.addStretch(1)
+            for sname, ssign in (("逆时针+90°", 90), ("顺时针-90°", -90)):
+                btn = QPushButton(sname)
+                btn.setFixedWidth(70)
+                btn.clicked.connect(lambda *_, a=axis, s=ssign: self.rotate_mesh(a, s))
+                row.addWidget(btn)
+            ee.addLayout(row)
+        mir_lab = QLabel("镜像（沿轴向平面翻转）")
+        mir_lab.setStyleSheet("color:#666; font-size:11px;")
+        ee.addWidget(mir_lab)
+        mir_row = QHBoxLayout()
+        for ax in ("X", "Y", "Z"):
+            btn = QPushButton(ax)
+            btn.setFixedWidth(44)
+            btn.clicked.connect(lambda *_, a=ax.lower(): self.mirror_mesh(a))
+            mir_row.addWidget(btn)
+        mir_row.addStretch(1)
+        ee.addLayout(mir_row)
+        # 共面合并
+        mg_lab = QLabel("共面合并（相邻面法向夹角阈值 °）")
+        mg_lab.setStyleSheet("color:#666; font-size:11px;")
+        ee.addWidget(mg_lab)
+        mg_row = QHBoxLayout()
+        self.spin_merge = QDoubleSpinBox()
+        self.spin_merge.setRange(0.1, 45.0)
+        self.spin_merge.setDecimals(1)
+        self.spin_merge.setValue(5.0)
+        mg_row.addWidget(self.spin_merge, 1)
+        btn_merge = QPushButton("合并共面面")
+        btn_merge.clicked.connect(self.apply_merge)
+        mg_row.addWidget(btn_merge)
+        ee.addLayout(mg_row)
+        btn_reset_mesh = QPushButton("重置网格（撤销编辑）")
+        btn_reset_mesh.clicked.connect(self.reset_mesh)
+        ee.addWidget(btn_reset_mesh)
+        btn_orient = QPushButton("修复法向（朝外，修 CAD 底面空）")
+        btn_orient.clicked.connect(self.orient_mesh)
+        ee.addWidget(btn_orient)
+        sel_row = QHBoxLayout()
+        self.chk_select = QCheckBox("选择多面（Shift+点击）")
+        self.chk_select.stateChanged.connect(self.on_select_mode)
+        btn_clear_sel = QPushButton("清空选择")
+        btn_clear_sel.clicked.connect(self.clear_selection)
+        btn_merge_sel = QPushButton("合并选中面")
+        btn_merge_sel.clicked.connect(self.merge_selected)
+        self.sel_count_label = QLabel("已选 0 面")
+        sel_row.addWidget(self.chk_select)
+        sel_row.addWidget(btn_clear_sel)
+        ee.addLayout(sel_row)
+        sel_row2 = QHBoxLayout()
+        sel_row2.addWidget(self.sel_count_label)
+        sel_row2.addWidget(btn_merge_sel)
+        sel_row2.addStretch(1)
+        ee.addLayout(sel_row2)
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("范围选中"))
+        pick_row.addWidget(QLabel("半径%"))
+        self.spin_pick_radius = QDoubleSpinBox()
+        self.spin_pick_radius.setRange(0.0, 100.0)
+        self.spin_pick_radius.setDecimals(1)
+        self.spin_pick_radius.setSingleStep(1.0)
+        self.spin_pick_radius.setValue(0.0)
+        pick_row.addWidget(self.spin_pick_radius, 1)
+        pick_row.addWidget(QLabel("(0=单选)"))
+        ee.addLayout(pick_row)
+        lv.addWidget(edit_grp)
+
         exp_grp = QGroupBox("STEP 导出设置")
         ev = QGridWrap(exp_grp)
         ev.addRow("标准", self.schema_combo())
@@ -143,6 +238,11 @@ class MainWindow(QMainWindow):
         self.chk_pcurves = QCheckBox("写曲面曲线(pcurve)")
         self.chk_pcurves.setChecked(True)
         ev.addWidget(self.chk_pcurves)
+        self.chk_analytic = QCheckBox("面拟合导出（analytic，合并平面区）")
+        self.chk_analytic.setChecked(False)
+        self.chk_analytic.setToolTip("把共面/同向的平面三角区拟合成单一平面面，其余区域逐三角缝合；"
+                                     "适合平面为主的机械件，可显著减少实体面数。")
+        ev.addWidget(self.chk_analytic)
         lv.addWidget(exp_grp)
 
         self.btn_convert = QPushButton("转换为实体")
@@ -179,6 +279,7 @@ class MainWindow(QMainWindow):
 
         # 双预览窗口：STL 在上，STEP 在下
         self.viewer_stl = GLCADViewWidget(title="STL 预览")
+        self.viewer_stl.facePicked.connect(self.on_stl_face_picked)
         self.viewer_step = GLCADViewWidget(title="STEP 预览")
         preview_splitter = QSplitter(Qt.Orientation.Vertical)
         preview_splitter.addWidget(self.viewer_stl)
@@ -267,6 +368,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "空网格", "文件中没有可用的三角形网格。")
             return
         self.mesh = mesh
+        self.base_mesh = mesh.copy()
         self.analysis = analyze(mesh)
         self._last_stl = path
         self.file_label.setText(path)
@@ -277,6 +379,141 @@ class MainWindow(QMainWindow):
             len(mesh.vertices), len(mesh.faces)))
         self.log("打开 {}：{} 顶点 / {} 面 / 水密={}".format(
             os.path.basename(path), len(mesh.vertices), len(mesh.faces), mesh.is_watertight))
+        self._update_face_count()
+
+    def _update_face_count(self, mesh=None):
+        mesh = mesh or self.mesh
+        if mesh is None:
+            self.face_count_label.setText("面片数：—")
+            return
+        self.face_count_label.setText("面片数：{}（顶点 {}）".format(len(mesh.faces), len(mesh.vertices)))
+
+    def _require_mesh(self):
+        if self.mesh is None:
+            QMessageBox.information(self, "提示", "请先打开一个 STL 文件。")
+            return False
+        return True
+
+    def _render_stl(self, fit_view=True):
+        if self.mesh is None:
+            self.viewer_stl.clear()
+            return
+        sel = None
+        if self.selected_faces:
+            n = len(self.mesh.faces)
+            mask = np.zeros(n, dtype=bool)
+            mask[list(self.selected_faces)] = True
+            sel = mask
+        self.viewer_stl.set_mesh(self.mesh, show_boundary=True, show_bad_faces=True,
+                                 color=self.model_rgba(), selected=sel,
+                                 pickable=self.chk_select.isChecked(),
+                                 show_faces=self.chk_select.isChecked(),
+                                 fit_view=fit_view)
+
+    def _update_selection_label(self):
+        self.sel_count_label.setText("已选 {} 面".format(len(self.selected_faces)))
+
+    def on_select_mode(self):
+        self.selected_faces.clear()
+        self._update_selection_label()
+        self._render_stl(fit_view=False)
+
+    def on_stl_face_picked(self, face, point=None):
+        if self.mesh is None:
+            return
+        # 范围选中：以命中点为圆心、半径内（面心距离）的三角面全部加入选择
+        radius = self.spin_pick_radius.value()
+        if radius > 0 and point is not None:
+            verts = np.asarray(self.mesh.vertices, dtype=float)
+            diag = float(np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))) or 1.0
+            r = radius / 100.0 * diag  # 滑块的 0-100 视为包围盒对角线的百分比
+            cents = verts[self.mesh.faces].mean(axis=1)
+            dist = np.linalg.norm(cents - np.asarray(point), axis=1)
+            hit = np.where(dist <= r)[0]
+            for i in hit.tolist():
+                self.selected_faces.add(int(i))
+        elif 0 <= face < len(self.mesh.faces):
+            if face in self.selected_faces:
+                self.selected_faces.discard(face)
+            else:
+                self.selected_faces.add(face)
+        self._update_selection_label()
+        self._render_stl(fit_view=False)
+        self.log("已选 {} 面".format(len(self.selected_faces)))
+
+    def clear_selection(self):
+        self.selected_faces.clear()
+        self._update_selection_label()
+        self._render_stl(fit_view=False)
+
+    def merge_selected(self):
+        if not self._require_mesh() or self.busy:
+            return
+        if len(self.selected_faces) < 2:
+            QMessageBox.information(self, "提示", "请先用 Shift+点击 选中至少 2 个相邻三角面再合并。")
+            return
+        # 把选中面视为一个区域做共面合并（仅合并严格共面的选中面）
+        from .mesh_editor import merge_coplanar
+        tol = self.spin_merge.value()
+        new_mesh = merge_coplanar(self.mesh, angle_tol_deg=tol, restrict=self.selected_faces)
+        before = len(self.mesh.faces)
+        self.selected_faces.clear()
+        self._update_selection_label()
+        self._apply_mesh_edit(new_mesh, "合并选中面 → {} 面".format(len(new_mesh.faces)))
+        self._render_stl()
+
+    def _apply_mesh_edit(self, new_mesh, note):
+        self.mesh = new_mesh
+        self.analysis = analyze(new_mesh)
+        self._render_stl(fit_view=False)
+        self._update_face_count()
+        self.log(note)
+        self.result_label.setText("当前 STL 编辑后：{} 面".format(len(new_mesh.faces)))
+
+    def rotate_mesh(self, axis, angle_deg):
+        if not self._require_mesh() or self.busy:
+            return
+        self._apply_mesh_edit(mesh_rotate(self.mesh, "xyz".index(axis), angle_deg),
+                              "旋转 {} 轴 {}°".format(axis.upper(), angle_deg))
+
+    def mirror_mesh(self, axis):
+        if not self._require_mesh() or self.busy:
+            return
+        self._apply_mesh_edit(mesh_mirror(self.mesh, "xyz".index(axis)),
+                              "镜像 {}".format(axis.upper()))
+
+    def apply_merge(self):
+        if not self._require_mesh() or self.busy:
+            return
+        tol = self.spin_merge.value()
+        from .mesh_editor import merge_coplanar
+        new_mesh = merge_coplanar(self.mesh, angle_tol_deg=tol)
+        before = len(self.mesh.faces)
+        self._apply_mesh_edit(new_mesh, "共面合并（阈值 {}°），{} → {} 面".format(
+            tol, before, len(new_mesh.faces)))
+
+    def reset_mesh(self):
+        if self.base_mesh is None:
+            QMessageBox.information(self, "提示", "尚未加载网格。")
+            return
+        self._apply_mesh_edit(self.base_mesh.copy(), "已重置网格（撤销所有编辑）")
+
+    def orient_mesh(self):
+        if not self._require_mesh() or self.busy:
+            return
+        if not self.mesh.is_watertight:
+            QMessageBox.information(self, "提示", "“修复法向朝外”仅适用于闭合（watertight）网格。")
+            return
+        try:
+            from .mesh_editor import orient_outward
+            new_mesh = orient_outward(self.mesh)
+        except Exception as exc:
+            QMessageBox.critical(self, "法向修复失败", str(exc))
+            self.log("法向修复失败：" + str(exc))
+            return
+        fixed = int((new_mesh.face_normals[:, 2] > 0.5).sum())
+        self._apply_mesh_edit(new_mesh, "修复法向（朝外）完成，水密={} 体积={:.4f}".format(
+            new_mesh.is_watertight, new_mesh.volume if new_mesh.is_watertight else float("nan")))
 
     def current_options(self):
         o = ConvertOptions()
@@ -284,6 +521,7 @@ class MainWindow(QMainWindow):
         o.fix_normals = self.chk_fix.isChecked()
         o.remove_degenerate = self.chk_deg.isChecked()
         o.tolerance = self.spin_tol.value()
+        o.analytic = self.chk_analytic.isChecked()
         return o
 
     def current_schema(self):
@@ -308,6 +546,11 @@ class MainWindow(QMainWindow):
             return
         if self.busy:
             return
+        # 需先完成过一次转换，生成真实 STEP 临时文件，导出=复制该文件
+        src = getattr(self, "current_step_path", None)
+        if not src or not os.path.exists(src):
+            QMessageBox.information(self, "提示", "请先点击“转换为实体”以生成 STEP 预览文件，再执行导出。")
+            return
         default = ""
         if getattr(self, "_last_stl", None):
             stem, _ = os.path.splitext(self._last_stl)
@@ -317,12 +560,16 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith((".step", ".stp")):
             path += ".step"
-        self._set_busy(True)
-        self.progress.setVisible(True)
-        self.progress.setValue(0)
-        self.result_label.setText("正在转换并导出…")
-        self.log("开始导出：{}".format(path))
-        self._start_worker(path)
+        try:
+            import shutil
+            shutil.copyfile(src, path)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            self.log("导出失败：" + str(exc))
+            return
+        self.log("导出成功：" + path)
+        self.result_label.setText("导出成功：{}".format(path))
+        QMessageBox.information(self, "导出完成", "STEP 文件已复制到：\n{}".format(path))
 
     def _start_worker(self, output_path):
         self.worker = ConvertWorker(
@@ -356,24 +603,23 @@ class MainWindow(QMainWindow):
             r.solid_count, r.shell_count, r.invalid_count))
         lines.append(r.message)
         self.analysis_box.setPlainText("\n".join(lines))
-        self._show_step_preview(r)
-        out = report.get("output")
-        if out:
-            if out["ok"]:
-                self.log(out["msg"] + " (" + out["path"] + ")")
-                self.result_label.setText("导出成功：{}（实体 {} 个）".format(out["path"], r.solid_count))
-                QMessageBox.information(self, "导出完成",
-                                        "STEP 文件已生成：\n{}\n\n实体：{} 个\n无效形状：{} 个".format(
-                                            out["path"], r.solid_count, r.invalid_count))
-            else:
-                self.log("导出失败：" + out["msg"])
-                self.result_label.setText("导出失败：{}".format(out["msg"]))
-                QMessageBox.critical(self, "导出失败", out["msg"])
+
+        step_path = report.get("step_path")
+        if step_path:
+            self.current_step_path = step_path
+        self._show_step_preview(step_path)
+
+        if report.get("output_path"):
+            # 直接导出到目标路径（worker 已写盘）
+            self.log("导出成功：" + step_path)
+            self.result_label.setText("导出成功：{}（实体 {} 个）".format(step_path, r.solid_count))
+            QMessageBox.information(self, "导出完成",
+                                    "STEP 文件已生成：\n{}\n\n实体：{} 个\n无效形状：{} 个".format(
+                                        step_path, r.solid_count, r.invalid_count))
         else:
-            self.result_label.setText("转换完成：实体 {} 个".format(r.solid_count))
-            QMessageBox.information(self, "转换完成",
-                                    "实体：{} 个\n开放壳：{} 个\n无效形状：{} 个\n\n{}".format(
-                                        r.solid_count, r.shell_count, r.invalid_count, r.message))
+            self.result_label.setText(
+                "转换完成，STEP 预留在临时目录。请在预览确认无误后点击“导出”（将复制该文件）。")
+            self.log("临时 STEP 已生成（预览依据）：" + step_path)
 
     def _on_error(self, msg):
         self.progress.setVisible(False)
@@ -382,24 +628,33 @@ class MainWindow(QMainWindow):
         self.log("错误：" + msg)
         QMessageBox.critical(self, "错误", msg)
 
-    def _show_step_preview(self, result):
+    def _show_step_preview(self, step_path=None):
+        """预览依据真实导出的 STEP 文件读回（所见即所得），而非直接离散内存 shape。"""
         try:
-            shapes = [s for s, v in result.shapes]
-            shape = make_compound(*shapes) if shapes else None
+            from .step_exporter import read_step
+            from .pipeline import shape_to_mesh
+
+            if not step_path or not os.path.exists(step_path):
+                self.viewer_step.clear()
+                self.step_preview_mesh = None
+                return
+            shape = read_step(step_path)
             if shape is None:
                 self.viewer_step.clear()
+                self.step_preview_mesh = None
+                self.log("STEP 预览：读回真实文件失败。")
                 return
             mesh = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
-            if mesh is not None:
+            if mesh is not None and len(mesh.faces) > 0:
                 self.step_preview_mesh = mesh
                 self.viewer_step.set_mesh(mesh, show_boundary=False, show_bad_faces=False,
                                           color=self.model_rgba())
-                self.result_label.setText("STEP 预览已更新")
             else:
-                self.step_preview_mesh = None
                 self.viewer_step.clear()
+                self.step_preview_mesh = None
         except Exception as exc:
             self.viewer_step.clear()
+            self.step_preview_mesh = None
             self.log("STEP 预览失败：" + str(exc))
 
     def reset_all_views(self):

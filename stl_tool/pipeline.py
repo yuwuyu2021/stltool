@@ -11,6 +11,8 @@ class ConvertOptions:
         self.fill_holes = True
         self.fix_normals = True
         self.remove_degenerate = True
+        self.analytic = False
+        self.parametric = False
 
     def as_dict(self):
         return {
@@ -18,6 +20,8 @@ class ConvertOptions:
             "自动补孔": self.fill_holes,
             "修复法向": self.fix_normals,
             "清理退化面": self.remove_degenerate,
+            "面拟合导出": self.analytic,
+            "参数化重建": self.parametric,
         }
 
 
@@ -30,20 +34,23 @@ def prepare_mesh(mesh, options=None):
     notes = []
     m = mesh
 
+    # 先修正法向朝外（作用于原始闭合网格，避免后续 process 重建破坏水密性）
+    if options.fix_normals and m.faces.shape[0] > 1:
+        try:
+            from .mesh_editor import orient_outward
+            m2 = orient_outward(m)
+            if m2 is not None and m2.is_watertight and m2.volume is not None:
+                m = m2
+                notes.append("已修正法向（所有面朝外）。")
+        except Exception:
+            pass
+
     if options.remove_degenerate:
         before = len(m.faces)
         if hasattr(m, "faces"):
             m = remove_degenerate(m)
         if len(m.faces) < before:
             notes.append("已清理 {} 个退化/重复面。".format(before - len(m.faces)))
-
-    if options.fix_normals and m.faces.shape[0] > 1:
-        try:
-            if not m.is_winding_consistent:
-                trimesh.repair.fix_normals(m)
-                notes.append("已修复法向朝向不一致的面。")
-        except Exception:
-            pass
 
     if options.fill_holes and not m.is_watertight:
         try:
@@ -78,8 +85,26 @@ def convert(mesh, options=None, progress_cb=None):
     opts = options or ConvertOptions()
     m, notes = prepare_mesh(mesh, opts)
     analysis = MeshAnalysis(m)
-    result = build_solid_from_mesh(m, tolerance=opts.tolerance, progress_cb=progress_cb)
-    result.prep_notes = notes
+    if opts.parametric:
+        from .parametric import convert_parametric
+        result = convert_parametric(m, tolerance=opts.tolerance,
+                                    progress_cb=progress_cb)
+        if not result.has_solid():
+            # 参数化失败自动回退
+            from .analytic import convert_analytic
+            result = convert_analytic(m, tolerance=opts.tolerance,
+                                      progress_cb=progress_cb)
+            result.prep_notes = notes + ["参数化重建未命中，自动回退面拟合/缝合法。"]
+        else:
+            result.prep_notes = notes
+    elif opts.analytic:
+        from .analytic import convert_analytic
+        result = convert_analytic(m, tolerance=opts.tolerance,
+                                  progress_cb=progress_cb)
+        result.prep_notes = notes
+    else:
+        result = build_solid_from_mesh(m, tolerance=opts.tolerance, progress_cb=progress_cb)
+        result.prep_notes = notes
     result.analysis = analysis
     return result
 
