@@ -282,6 +282,55 @@ def test_convert_parametric_plate():
             "体积误差 {:.1%}".format((sv - plate.volume) / plate.volume)
 
 
+def test_convert_parametric_counterbore():
+    """沉孔板：顶面下沉圆台+同心通孔，重建出沉孔圆柱布尔减且体积近似。"""
+    from stl_tool.parametric import _volume
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2, gp_Vec
+
+    # 板 40x30x4，通孔 r=2.5，沉孔大孔 r=5 深度2（顶面下沉台）
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40, 30, 4).Shape()
+    thru = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20, 15, -0.5), gp_Dir(0, 0, 1)), 2.5, 5).Shape()
+    cbor = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20, 15, 2), gp_Dir(0, 0, 1)), 5.0, 2.5).Shape()
+    solid = BRepAlgoAPI_Cut(plate, thru).Shape()
+    solid = BRepAlgoAPI_Cut(solid, cbor).Shape()
+
+    # OCP shape -> trimesh，再修复法向朝外（模拟真实 STL 预处理）
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh
+    mesh = shape_to_mesh(solid)
+    assert mesh is not None and mesh.is_watertight
+    mesh, _ = prepare_mesh(mesh)
+
+    from stl_tool.pipeline import ConvertOptions
+    opts = ConvertOptions()
+    opts.parametric = True
+    opts.tolerance = 1e-4
+    r = convert(mesh, opts)
+    assert r.solid_count == 1, r.message
+    assert getattr(r, "param_type", None) == "plate", r.message
+
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    n = 0
+    for s, v in r.shapes:
+        e = TopExp_Explorer(s, TopAbs_FACE)
+        while e.More():
+            n += 1
+            e.Next()
+    assert n < len(mesh.faces) / 10, "面数 {} 应远低于原 {}".format(n, len(mesh.faces))
+    shapes = [s for s, v in r.shapes if v]
+    comp = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
+    sv = _volume(comp) if comp is not None else None
+    if sv is not None:
+        assert abs(sv - mesh.volume) / mesh.volume < 0.15, \
+            "体积误差 {:.1%}".format((sv - mesh.volume) / mesh.volume)
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
@@ -305,4 +354,6 @@ if __name__ == "__main__":
     print("parametric ok")
     test_convert_parametric_plate()
     print("parametric-plate ok")
+    test_convert_parametric_counterbore()
+    print("counterbore ok")
     print("ALL TESTS PASSED")

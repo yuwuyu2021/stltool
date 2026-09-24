@@ -529,7 +529,10 @@ def _base_plane_profile(mesh, axis, cos_tol=0.85, min_area_frac=0.25):
             continue
         blocks.sort(key=lambda b: -b.area)
         big = blocks[0]
-        if big.area / areas[sel].sum() < 0.6:
+        # 最大块占单侧面覆盖面积（unary_union 已去重，抗双面网格）的比例
+        covered = merged.area if merged.geom_type == "Polygon" else \
+            sum(b.area for b in blocks)
+        if covered > 1e-9 and big.area / covered < 0.6:
             continue
         if best is None or big.area > best[1].area:
             best = (sign, big)
@@ -557,11 +560,43 @@ def _loop_rdp(loop2d, eps):
     return out
 
 
+def hole_is_circle(inner, min_d=1.5, max_ratio=1.05, area_ok=0.99):
+        """判定孔是否近似圆并通过面积一致性。返回 (cx, cy, r) 或 None。
+
+        - bbox 宽高比 ≤ max_ratio（排除长条/异形）
+        - 环围成 Polygon 面积 vs πr² 一致性 ≥ area_ok（只接受真圆）
+        半径用 bbox 平均（对真圆即精确半径）。
+        """
+        import shapely.geometry as sg
+        pts = np.asarray(inner.coords, dtype=np.float64)
+        if len(pts) < 6:
+            return None
+        x, y = pts[:, 0], pts[:, 1]
+        bw = x.max() - x.min()
+        bh = y.max() - y.min()
+        dmin = min(bw, bh)
+        dmax = max(bw, bh)
+        if dmin < min_d or dmax / dmin > max_ratio:
+            return None
+        cx, cy = (x.min() + x.max()) / 2.0, (y.min() + y.max()) / 2.0
+        r = (dmin + dmax) / 4.0
+        if r <= 0:
+            return None
+        try:
+            ring = sg.Polygon(pts)
+            ring_area = abs(ring.area)
+        except Exception:
+            ring_area = 0.0
+        if ring_area <= 0 or ring_area / (np.pi * r * r) < area_ok:
+            return None
+        return (cx, cy, r)
+
+
 def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
                    tol=1e-5, rdp_eps=0.2):
     """由 2D 多边形（外环+孔）挤出成实体。
 
-    poly2d:    shapely 多边形（位于 uv 平面）
+    poly2d:    shapely 多边形（位于 uv 平面)）
     basis:     (2,3) 正交基，uv→世界
     origin:    底面原点（世界坐标）
     height_vec: 挤出向量（世界坐标，长度=板厚，方向朝内表面）
@@ -622,37 +657,6 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
         if not f.IsDone():
             return None
         return f.Face()
-
-    def hole_is_circle(inner, min_d=1.5, max_ratio=1.05, area_ok=0.99):
-        """判定孔是否近似圆并通过面积一致性。返回 (cx, cy, r) 或 None。
-
-        - bbox 宽高比 ≤ max_ratio（排除长条/异形）
-        - 环围成 Polygon 面积 vs πr² 一致性 ≥ area_ok（只接受真圆）
-        半径用 bbox 平均（对真圆即精确半径）。
-        """
-        import shapely.geometry as sg
-        pts = np.asarray(inner.coords, dtype=np.float64)
-        if len(pts) < 6:
-            return None
-        x, y = pts[:, 0], pts[:, 1]
-        bw = x.max() - x.min()
-        bh = y.max() - y.min()
-        dmin = min(bw, bh)
-        dmax = max(bw, bh)
-        if dmin < min_d or dmax / dmin > max_ratio:
-            return None
-        cx, cy = (x.min() + x.max()) / 2.0, (y.min() + y.max()) / 2.0
-        r = (dmin + dmax) / 4.0
-        if r <= 0:
-            return None
-        try:
-            ring = sg.Polygon(pts)
-            ring_area = abs(ring.area)
-        except Exception:
-            ring_area = 0.0
-        if ring_area <= 0 or ring_area / (np.pi * r * r) < area_ok:
-            return None
-        return (cx, cy, r)
 
     def make_hole_cut(inner):
         """构造孔切除体：圆孔用解析圆柱，其他用挤出多边形。返回 shape 或 None。"""
@@ -724,7 +728,6 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         sv.update(mesh.faces[i])
     sv = np.array(sorted(sv))
     z_s = v[sv] @ axis
-    z_surf = np.percentile(z_s, 5) if side.size else z_s.min()
 
     other = np.where(normals @ plane_n < -0.9)[0]
     if len(other) == 0:
@@ -734,7 +737,18 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         ov.update(mesh.faces[i])
     ov = np.array(sorted(ov))
     z_o = v[ov] @ axis
-    z_other = np.percentile(z_o, 50)
+
+    if float(np.median(z_o)) > float(np.median(z_s)):
+        top_pts, top_z = v[ov], z_o
+        bot_pts, bot_z = v[sv], z_s
+    else:
+        top_pts, top_z = v[sv], z_s
+        bot_pts, bot_z = v[ov], z_o
+    # 主体平面高度：计数中位在真实板最准（v0.3.0 验证，顶面主体占多）。
+    # 但 shape_to_mesh 合成件顶点密度不均（沉孔台面点反而多）会拉偏，
+    # 此时用面积加权中位回退（见体积校验失败处）。
+    z_other = max(float(np.percentile(bot_z, 50)), float(np.percentile(top_z, 50)))
+    z_surf = min(float(np.percentile(bot_z, 2)), float(np.percentile(top_z, 2)))
 
     thickness = abs(z_other - z_surf)
     if thickness < 1e-9:
@@ -748,12 +762,32 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     if thickness / major > 0.5:
         return None, None
 
-    # 体积校验（相对）
+    none_w = None  # 加权回退标记：沉孔检测用原 top_z，挤出高度用推定的主体面
+
+    # 体积校验（相对）；失败时用面积加权中位重估主体面高再试一次
     vol = _volume_approx(mesh)
     if vol is not None and vol > 0:
         est = poly.area * thickness
         if abs(est - vol) / vol > 0.25:
-            return None, None
+            # 计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
+            # 多于主体板面）拉偏 → 面积加权中位把权重回归主体大平面
+            def _wmed(d_vals, w_vals):
+                i = np.argsort(d_vals)
+                cw = np.cumsum(w_vals[i])
+                return float(d_vals[i][np.searchsorted(cw, cw[-1] * 0.5)])
+            wa_other = _wmed(z_o, mesh.area_faces[other])
+            wa_side = _wmed(z_s, mesh.area_faces[side])
+            z_other2 = max(wa_other, wa_side)
+            z_surf2 = min(z_surf, z_other2 - thickness)
+            t2 = abs(z_other2 - z_surf2)
+            if t2 >= 1e-9:
+                est2 = poly.area * t2
+                if abs(est2 - vol) / vol > 0.25:
+                    return None, None
+                thickness = t2
+                z_other = z_other2
+                z_surf = z_surf2
+                none_w = 1
 
     # 组装挤出
     u = np.cross(axis, np.array([1.0, 0.0, 0.0]))
@@ -767,16 +801,74 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     z_base = z_surf if z_other > z_surf else z_surf - thickness
     origin = basis[0] * c[0] + basis[1] * c[1] + axis * z_base
     height_vec = axis * (z_other - z_surf)
+    drill_axis = axis.copy()
+    if np.dot(drill_axis, height_vec) < 0:
+        drill_axis = -drill_axis
 
     solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n)
     if solid is None:
         return None, None
+
+    # ---- 沉孔/台阶检测：顶面局部下沉环 + 中心同心通孔 ----
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    n_cb = 0
+    hole_centers = []
+    for inner in poly.interiors:
+        pts = np.asarray(inner.coords, dtype=np.float64)
+        if len(pts) < 6:
+            continue
+        hole_centers.append((float(pts[:, 0].mean()), float(pts[:, 1].mean()),
+                             float(min(np.ptp(pts[:, 0]), np.ptp(pts[:, 1])) / 2.0)))
+    if hole_centers:
+        depth_min = max(0.8, 0.15 * thickness)
+        uv_top = (top_pts @ basis.T)         # 与 poly 同坐标系（世界原点投影，无平移）
+        top_zsel = top_z
+        low = top_zsel < z_other - depth_min   # 显著低于主体顶面的下沉点
+        if np.count_nonzero(low) >= 6:
+            for (cx, cy, r) in hole_centers:
+                dist = np.sqrt(
+                    (uv_top[low, 0] - cx) ** 2 + (uv_top[low, 1] - cy) ** 2)
+                # 窗口：真沉孔台≈(1~2)×通孔半径（太宽会把"孔位于大面积下沉
+                # 平原"误判；太窄会滤掉台半径≈2r 的真沉孔台）
+                near = dist < 2.0 * r + 2.0
+                if np.count_nonzero(near) < 6:
+                    continue
+                # 孔自身的通孔壁低洼点很少（通孔下方无顶面）；若中心区
+                # 低洼点密集说明该处本就是下沉槽而非真沉孔环
+                near_c = np.count_nonzero(dist < r * 0.7)
+                if near_c > np.count_nonzero(near) * 0.35:
+                    continue
+                # 沉孔台面半径：近窗内下沉点的 95 分位
+                r_cb = float(np.percentile(dist[near], 95))
+                # 台面至少比通孔显著宽、且不超过 2.4 倍通孔（真沉孔台有限宽，
+                # 更宽多是"孔落在大面积下沉槽"情形）
+                if r_cb < r + 0.4 or r_cb > 2.4 * max(r, 1.5):
+                    continue
+                z_sunk = float(np.mean(top_zsel[low][near]))
+                # 沉孔台面应为近似平面：z 离散度小（真沉孔平台共面）
+                z_flat = float(np.std(top_zsel[low][near]))
+                if z_flat > 0.25 * max(depth_min, 0.5):
+                    continue
+                # 沉孔不能穿透到接近底面（否则是贯穿大孔，非台阶）
+                if z_sunk - z_surf < 0.2 * thickness:
+                    continue
+                c3 = origin + basis[0] * cx + basis[1] * cy + drill_axis * (z_sunk - z_base)
+                cb = BRepPrimAPI_MakeCylinder(
+                    gp_Ax2(gp_Pnt(*c3), gp_Dir(*drill_axis)),
+                    r_cb, (z_other - z_sunk) + 0.5e-5).Shape()
+                cut = BRepAlgoAPI_Cut(solid, cb)
+                if cut.IsDone() and _valid(cut.Shape()):
+                    solid = cut.Shape()
+                    n_cb += 1
 
     info = {
         "outer_pts": len(poly.exterior.coords),
         "hole_count": len(poly.interiors),
         "thickness": float(thickness),
         "area": float(poly.area),
+        "counterbores": n_cb,
     }
     return solid, info
 
