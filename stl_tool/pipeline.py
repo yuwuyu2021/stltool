@@ -95,6 +95,8 @@ def convert(mesh, options=None, progress_cb=None):
             result = convert_analytic(m, tolerance=opts.tolerance,
                                       progress_cb=progress_cb)
             result.prep_notes = notes + ["参数化重建未命中，自动回退面拟合/缝合法。"]
+            if not hasattr(result, "param_type"):
+                result.param_type = "fallback"
         else:
             result.prep_notes = notes
     elif opts.analytic:

@@ -471,6 +471,258 @@ def detect_revolve(mesh, tol_frac=0.006, max_rel_vol_err=0.30, progress_cb=None)
 
 
 # ------------------------------------------------------------------ #
+# 板件重建（薄板 + 孔特征）
+#
+# 对"带孔薄板"类零件（设备外壳侧板等），识别厚度方向上的底面
+# 大平面 → 投影提取外轮廓 + 孔轮廓 → 挤出成实心板。
+# 纯算法对平面板件最主要的降面手段：2万+ 三角面 → 数百面。
+
+
+def _find_thickness_axis(mesh):
+    """PCA 找厚度方向（最小跨度轴）。返回单位轴向量。"""
+    v = mesh.vertices
+    cent = v.mean(0)
+    cov = np.cov((v - cent).T)
+    w, vec = np.linalg.eigh(cov)
+    return vec[:, 0]
+
+
+def _base_plane_profile(mesh, axis, cos_tol=0.85, min_area_frac=0.25):
+    """沿轴找最大的共面单侧面片集，投影聚合出外轮廓+孔多边形。
+
+    返回 (polygon, plane_n)：
+      polygon    shapely 多边形（外环+孔内环）
+      plane_n    底面主平面单位法向（朝外，即厚度方向外法向）
+    无法识别返回 (None, None)。
+    """
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+
+    nf = mesh.faces
+    verts = mesh.vertices
+    normals = _face_normals(nf, verts)
+    dot = normals @ axis
+    p = np.cross(mesh.triangles[:, 1] - mesh.triangles[:, 0],
+                 mesh.triangles[:, 2] - mesh.triangles[:, 0])
+    areas = 0.5 * np.sqrt((p * p).sum(1))
+    total = areas.sum()
+
+    best = None
+    for sign in (1.0, -1.0):
+        sel = np.where(dot * sign > cos_tol)[0]
+        if len(sel) < 20 or areas[sel].sum() / total < min_area_frac:
+            continue
+        u = np.cross(axis, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(u) < 1e-9:
+            u = np.cross(axis, np.array([0.0, 1.0, 0.0]))
+        u /= np.linalg.norm(u)
+        vv = np.cross(axis, u)
+        basis = np.array([u, vv])
+        try:
+            polys = [sg.Polygon(t @ basis.T) for t in mesh.triangles[sel]]
+            merged = unary_union(polys)
+        except Exception:
+            continue
+        blocks = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+        blocks = [b for b in blocks if b.area > 1e-9]
+        if not blocks:
+            continue
+        blocks.sort(key=lambda b: -b.area)
+        big = blocks[0]
+        if big.area / areas[sel].sum() < 0.6:
+            continue
+        if best is None or big.area > best[1].area:
+            best = (sign, big)
+
+    if best is None:
+        return None, None
+    sign, poly = best
+    nrm = axis * sign
+    return poly, nrm
+
+
+def _loop_rdp(loop2d, eps):
+    """对闭合环坐标做 RDP 简化，保持首尾闭合。返回简化后的坐标数组。"""
+    arr = np.asarray(loop2d, dtype=np.float64)
+    closed = False
+    if len(arr) >= 2 and np.allclose(arr[0], arr[-1]):
+        arr = arr[:-1]
+        closed = True
+    if len(arr) < 3:
+        return np.asarray(loop2d)
+    keep = _rdp(arr, eps)
+    out = arr[np.asarray(keep)]
+    if closed:
+        out = np.vstack([out, out[0]])
+    return out
+
+
+def _extrude_solid(poly2d, basis, origin, height_vec, tol=1e-5, rdp_eps=0.2):
+    """由 2D 多边形（外环+孔）挤出成实体。
+
+    poly2d:    shapely 多边形（位于 uv 平面）
+    basis:     (2,3) 正交基，uv→世界
+    origin:    底面原点（世界坐标）
+    height_vec: 挤出向量（世界坐标，长度=板厚，方向朝内表面）
+    返回 OCP shape 或 None。
+    """
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace,
+    )
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+
+    def wire3d(loop):
+        pts = np.asarray(loop, dtype=np.float64)
+        if rdp_eps and pts is not None and len(pts) > 8:
+            pts = _loop_rdp(pts, rdp_eps)
+        if len(pts) < 3:
+            return None
+        mw = BRepBuilderAPI_MakeWire()
+        for i in range(len(pts)):
+            p = origin + basis[0] * pts[i][0] + basis[1] * pts[i][1]
+            q = origin + basis[0] * pts[(i + 1) % len(pts)][0] + basis[1] * pts[(i + 1) % len(pts)][1]
+            try:
+                e = BRepBuilderAPI_MakeEdge(gp_Pnt(*p), gp_Pnt(*q))
+                if not e.IsDone():
+                    continue
+                mw.Add(e.Edge())
+            except Exception:
+                pass
+        if not mw.IsDone() or mw.Wire().IsNull():
+            return None
+        return mw.Wire()
+
+    def face_of(loop):
+        w = wire3d(loop)
+        if w is None:
+            return None
+        try:
+            f = BRepBuilderAPI_MakeFace(w, True)
+        except Exception:
+            return None
+        if not f.IsDone():
+            return None
+        return f.Face()
+
+    outer_loop = list(poly2d.exterior.coords)
+    if outer_loop[0] == outer_loop[-1]:
+        outer_loop = outer_loop[:-1]
+    f = face_of(outer_loop)
+    if f is None:
+        return None
+    solid = BRepPrimAPI_MakePrism(f, gp_Vec(*height_vec)).Shape()
+
+    for inner in poly2d.interiors:
+        try:
+            loop = list(inner.coords)
+            if loop[0] == loop[-1]:
+                loop = loop[:-1]
+            f2 = face_of(loop)
+            if f2 is None:
+                continue
+            hole = BRepPrimAPI_MakePrism(f2, gp_Vec(*height_vec)).Shape()
+            cut = BRepAlgoAPI_Cut(solid, hole)
+            if cut.IsDone():
+                solid = cut.Shape()
+        except Exception:
+            continue
+    if not _valid(solid):
+        return None
+    return solid
+
+
+def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
+    """识别带孔薄板并重建为挤出实体。
+
+    判定：
+      - PCA 厚度轴
+      - 侧面大平面面积占比 ≥ min_flat_frac
+      - 板厚（两表面距离）相对外形小 → 扁率
+    返回 (shape, info) / (None, None)。info = dict(outer_pts, hole_count, thickness, box_hot)。
+    """
+    v = mesh.vertices
+    axis = _find_thickness_axis(mesh)
+    poly, plane_n = _base_plane_profile(mesh, axis)
+    if poly is None:
+        return None, None
+
+    # 底面/顶面位置：法向平行 plane_n 的面片顶点轴向
+    normals = _face_normals(mesh.faces, v)
+    side = np.where(normals @ plane_n > 0.9)[0]
+    if len(side) == 0:
+        return None, None
+    sv = set()
+    for i in side:
+        sv.update(mesh.faces[i])
+    sv = np.array(sorted(sv))
+    z_s = v[sv] @ axis
+    z_surf = np.percentile(z_s, 5) if side.size else z_s.min()
+
+    other = np.where(normals @ plane_n < -0.9)[0]
+    if len(other) == 0:
+        return None, None
+    ov = set()
+    for i in other:
+        ov.update(mesh.faces[i])
+    ov = np.array(sorted(ov))
+    z_o = v[ov] @ axis
+    z_other = np.percentile(z_o, 50)
+
+    thickness = abs(z_other - z_surf)
+    if thickness < 1e-9:
+        return None, None
+
+    # 扁率：厚度 / 外环主尺寸
+    minx, miny, maxx, maxy = poly.bounds
+    major = max(maxx - minx, maxy - miny)
+    if major < 1e-9:
+        return None, None
+    if thickness / major > 0.5:
+        return None, None
+
+    # 体积校验（相对）
+    vol = _volume_approx(mesh)
+    if vol is not None and vol > 0:
+        est = poly.area * thickness
+        if abs(est - vol) / vol > 0.25:
+            return None, None
+
+    # 组装挤出
+    u = np.cross(axis, np.array([1.0, 0.0, 0.0]))
+    if np.linalg.norm(u) < 1e-9:
+        u = np.cross(axis, np.array([0.0, 1.0, 0.0]))
+    u /= np.linalg.norm(u)
+    vv = np.cross(axis, u)
+    basis = np.array([u, vv])
+
+    c = np.array(poly.centroid.coords[0], dtype=np.float64)
+    z_base = z_surf if z_other > z_surf else z_surf - thickness
+    origin = basis[0] * c[0] + basis[1] * c[1] + axis * z_base
+    height_vec = axis * (z_other - z_surf)
+
+    solid = _extrude_solid(poly, basis, origin, height_vec)
+    if solid is None:
+        return None, None
+
+    info = {
+        "outer_pts": len(poly.exterior.coords),
+        "hole_count": len(poly.interiors),
+        "thickness": float(thickness),
+        "area": float(poly.area),
+    }
+    return solid, info
+
+
+def _volume_approx(mesh):
+    try:
+        return float(mesh.volume)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------ #
 # 顶层入口
 
 
@@ -515,8 +767,17 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
             result.param_type = "revolve"
             note = "识别为回转体（母线 {} 段）".format(result.primitives)
         else:
-            result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体），请走逐三角或 analytic 模式。"
-            return result
+            shape, info = detect_plate(mesh, tol_frac=tol_frac, progress_cb=cb)
+            if shape is not None:
+                result.shapes.append((shape, True))
+                result.solid_count = 1
+                result.primitives = int(info["outer_pts"]) + int(info["hole_count"])
+                result.param_type = "plate"
+                note = "识别为带孔薄板（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
+                    info["outer_pts"], info["hole_count"], info["thickness"])
+            else:
+                result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
+                return result
 
     for s, _ in result.shapes:
         if not _valid(s):

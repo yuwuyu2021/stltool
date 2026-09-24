@@ -238,6 +238,50 @@ def test_convert_parametric():
     assert r2.solid_count >= 1
 
 
+def test_convert_parametric_plate():
+    """带孔薄板：extrusion 重建，面数显著下降且体积近似。"""
+    from stl_tool.parametric import _volume
+
+    # 造带孔薄板：外框 + 三个圆孔（extrude_polygon 支持孔）
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+    outer = sg.Polygon([(0, 0), (40, 0), (40, 30), (0, 30)])
+    holes = [
+        sg.Point(10, 8).buffer(3.0),
+        sg.Point(28, 20).buffer(5.0),
+        sg.Point(28, 8).buffer(3.0),
+    ]
+    plate_poly = outer.difference(unary_union(holes))
+    plate = trimesh.creation.extrude_polygon(plate_poly, height=4)
+    assert plate.is_watertight, "测试板应水密"
+
+    from stl_tool.pipeline import ConvertOptions
+    opts = ConvertOptions()
+    opts.parametric = True
+    opts.tolerance = 1e-4
+    r = convert(plate, opts)
+    assert r.solid_count == 1, r.message
+    assert r.invalid_count == 0, r.message
+    assert getattr(r, "param_type", None) == "plate", \
+        "期望 plate 实际 {}".format(getattr(r, "param_type", None))
+
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    n = 0
+    for s, v in r.shapes:
+        e = TopExp_Explorer(s, TopAbs_FACE)
+        while e.More():
+            n += 1
+            e.Next()
+    assert n < len(plate.faces) / 10, "面数 {} 应远低于原 {}".format(n, len(plate.faces))
+    shapes = [s for s, v in r.shapes if v]
+    comp = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
+    sv = _volume(comp) if comp is not None else None
+    if sv is not None:
+        assert abs(sv - plate.volume) / plate.volume < 0.15, \
+            "体积误差 {:.1%}".format((sv - plate.volume) / plate.volume)
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
@@ -259,4 +303,6 @@ if __name__ == "__main__":
     print("orient-outward ok")
     test_convert_parametric()
     print("parametric ok")
+    test_convert_parametric_plate()
+    print("parametric-plate ok")
     print("ALL TESTS PASSED")
