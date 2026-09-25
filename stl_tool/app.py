@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import os
 import time
 
@@ -13,8 +14,6 @@ from PyQt6.QtWidgets import (
 
 from . import APP_NAME, VERSION
 from .widget3d import GLCADViewWidget
-from .pipeline import convert, ConvertOptions, make_compound, shape_to_mesh
-from .step_exporter import write_step
 
 GITHUB_REPO = "https://github.com/yuwuyu2021/stltool"
 GITHUB_RELEASES = GITHUB_REPO + "/releases"
@@ -29,6 +28,75 @@ def _step_out_path(src_file, src_dir, out_dir):
         if rel_dir and rel_dir != ".":
             rel = rel_dir + os.sep
     return os.path.join(out_dir, rel + stem + ".step")
+
+
+def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
+    """在独立子进程中执行单个文件的完整转换（spawn 目标函数，须为模块顶层）。
+
+    子进程拥有独立 GIL，长耗时重建不再阻塞 GUI 事件循环。
+    返回可 Pickle 的汇总字典；预览用 trimesh 网格一并返回。
+    """
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    from .pipeline import convert, ConvertOptions, make_compound, shape_to_mesh
+    from .step_exporter import write_step
+
+    t1 = time.time()
+    try:
+        mesh = trimesh.load(src_file, force="mesh")
+    except Exception as exc:
+        return {"ok": False, "error": "读取失败：" + str(exc), "preview_mesh": None}
+    if mesh is None or mesh.faces is None or len(mesh.faces) == 0:
+        return {"ok": False, "error": "空网格", "preview_mesh": None}
+    vol_mesh = float(mesh.volume) if mesh.is_watertight else None
+
+    try:
+        opts = ConvertOptions()
+        opts.parametric = True  # 自动选择：参数化重建 → 未命中自动回退
+        res = convert(mesh, opts)
+        shapes = [s for s, v in res.shapes if v] or [s for s, _ in res.shapes]
+        shape = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
+        if shape is None:
+            raise RuntimeError("没有可导出的实体形状。")
+        out = _step_out_path(src_file, src_dir, out_dir)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        ok_w, msg = write_step(shape, out, schema=schema, write_pcurves=write_pcurves)
+        if not ok_w:
+            raise RuntimeError(msg)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "preview_mesh": mesh}
+
+    kind = getattr(res, "param_type", "") or "逐三角"
+    n_new = 0
+    for sh in shapes:
+        e = TopExp_Explorer(sh, TopAbs_FACE)
+        while e.More():
+            n_new += 1
+            e.Next()
+    pr = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, pr)
+    vol_step = pr.Mass()
+    step_mesh = None
+    try:
+        sm = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
+        if sm is not None and len(sm.faces) > 0:
+            step_mesh = sm
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "out_path": out,
+        "preview_mesh": mesh,
+        "step_mesh": step_mesh,
+        "vol_mesh": vol_mesh,
+        "vol_step": vol_step,
+        "kind": kind,
+        "n_new": n_new,
+        "seconds": time.time() - t1,
+    }
 
 
 class BatchWorker(QThread):
@@ -47,87 +115,52 @@ class BatchWorker(QThread):
         self.write_pcurves = write_pcurves
 
     def run(self):
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE
-        from OCP.GProp import GProp_GProps
-        from OCP.BRepGProp import BRepGProp
-
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(1)  # 1 个转换子进程：界面进程 GIL 完全空闲，界面与旋转保持流畅
         t0 = time.time()
         ok = failed = 0
         failed_files = []
         n = len(self.files)
-        for i, f in enumerate(self.files):
-            self.progress.emit(i, n)
-            self.log_msg.emit("-" * 62)
-            self.log_msg.emit("[{}/{}] 文件：{}".format(i + 1, n, os.path.basename(f)))
-            try:
-                mesh = trimesh.load(f, force="mesh")
-            except Exception as exc:
-                failed += 1
-                failed_files.append((f, "读取失败：" + str(exc)))
-                self.log_msg.emit("  读取失败：" + str(exc))
-                continue
-            if mesh is None or mesh.faces is None or len(mesh.faces) == 0:
-                failed += 1
-                failed_files.append((f, "空网格"))
-                self.log_msg.emit("  空网格，跳过。")
-                continue
-
-            self.preview.emit(mesh)
-            vol_mesh = float(mesh.volume) if mesh.is_watertight else None
-            self.log_msg.emit("  顶点 {} / 面 {} / 水密 {} / 体积 {:.3f}".format(
-                len(mesh.vertices), len(mesh.faces), mesh.is_watertight,
-                vol_mesh if vol_mesh is not None else float("nan")))
-
-            opts = ConvertOptions()
-            opts.parametric = True  # 自动选择：参数化重建 → 未命中自动回退
-            t1 = time.time()
-            try:
-                res = convert(mesh, opts)
-                shapes = [s for s, v in res.shapes if v] or [s for s, _ in res.shapes]
-                shape = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
-                if shape is None:
-                    raise RuntimeError("没有可导出的实体形状。")
-                out = _step_out_path(f, self.src_dir, self.out_dir)
-                os.makedirs(os.path.dirname(out), exist_ok=True)
-                ok_w, msg = write_step(shape, out, schema=self.schema, write_pcurves=self.write_pcurves)
-                if not ok_w:
-                    raise RuntimeError(msg)
-            except Exception as exc:
-                failed += 1
-                failed_files.append((f, str(exc)))
-                self.log_msg.emit("  转换失败：" + str(exc))
-                continue
-            dt = time.time() - t1
-
-            # 统计：实体面数 / 体积 / 重建方式
-            kind = getattr(res, "param_type", "") or "逐三角"
-            n_new = 0
-            for sh in shapes:
-                e = TopExp_Explorer(sh, TopAbs_FACE)
-                while e.More():
-                    n_new += 1
-                    e.Next()
-            pr = GProp_GProps()
-            BRepGProp.VolumeProperties_s(shape, pr)
-            vol_step = pr.Mass()
-            if vol_mesh and vol_mesh > 0:
-                err = (vol_step - vol_mesh) / vol_mesh * 100.0
-            else:
-                err = float("nan")
-            self.log_msg.emit("  导出成功：{}".format(out))
-            self.log_msg.emit("  重建：{} | 实体面 {} | 体积 网格 {:.3f} / STEP {:.3f}（{:+.1f}%），耗时 {:.1f}s".format(
-                kind, n_new, vol_mesh or 0.0, vol_step, err, dt))
-            ok += 1
-
-            try:
-                sm = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
-                if sm is not None and len(sm.faces) > 0:
-                    self.step_preview.emit(sm)
-            except Exception:
-                pass
-
-        self.progress.emit(n, n)
+        try:
+            for i, f in enumerate(self.files):
+                self.progress.emit(i, n)
+                self.log_msg.emit("-" * 62)
+                self.log_msg.emit("[{}/{}] 文件：{}".format(i + 1, n, os.path.basename(f)))
+                try:
+                    res = pool.apply(_proc_convert, (f, self.src_dir, self.out_dir,
+                                                     self.schema, self.write_pcurves))
+                except Exception as exc:
+                    res = {"ok": False, "error": "子进程异常：" + str(exc), "preview_mesh": None}
+                if res.get("ok"):
+                    pm = res.get("preview_mesh")
+                    if pm is not None:
+                        self.preview.emit(pm)
+                    vol_mesh = res.get("vol_mesh")
+                    if vol_mesh is not None and vol_mesh > 0:
+                        err = (res.get("vol_step", 0.0) - vol_mesh) / vol_mesh * 100.0
+                    else:
+                        err = float("nan")
+                    vol_m = vol_mesh if vol_mesh is not None else 0.0
+                    self.log_msg.emit("  顶点/面（见预览），体积 网格 {:.3f}".format(vol_m))
+                    self.log_msg.emit("  导出成功：{}".format(res["out_path"]))
+                    self.log_msg.emit("  重建：{} | 实体面 {} | 体积 网格 {:.3f} / STEP {:.3f}（{:+.1f}%），耗时 {:.1f}s".format(
+                        res.get("kind", ""), res.get("n_new", 0), vol_m,
+                        res.get("vol_step", 0.0), err, res.get("seconds", 0.0)))
+                    sm = res.get("step_mesh")
+                    if sm is not None:
+                        self.step_preview.emit(sm)
+                    ok += 1
+                else:
+                    failed += 1
+                    failed_files.append((f, res.get("error", "未知错误")))
+                    pm = res.get("preview_mesh")
+                    if pm is not None:
+                        self.preview.emit(pm)
+                    self.log_msg.emit("  转换失败：" + str(res.get("error", "")))
+            self.progress.emit(n, n)
+        finally:
+            pool.terminate()
+            pool.join()
         self.log_msg.emit("-" * 62)
         self.finished.emit({
             "total": n, "ok": ok, "failed": failed,
@@ -322,7 +355,7 @@ class MainWindow(QMainWindow):
             return
         if mesh is not None and len(mesh.faces) > 0:
             self.current_mesh = mesh
-            self.viewer.set_mesh(mesh, show_boundary=True, show_bad_faces=True)
+            self.viewer.set_mesh(mesh, show_boundary=True, show_bad_faces=True, show_faces=False)
             self.viewer.title_label.setText("预览：{}".format(os.path.basename(path)))
             self.log("已加载 {}：顶点 {} / 面 {} / 水密 {}".format(
                 os.path.basename(path), len(mesh.vertices), len(mesh.faces), mesh.is_watertight))
@@ -378,12 +411,12 @@ class MainWindow(QMainWindow):
 
     def _on_preview(self, mesh):
         try:
-            self.viewer.set_mesh(mesh, show_boundary=True, show_bad_faces=True)
+            self.viewer.set_mesh(mesh, show_boundary=True, show_bad_faces=True, show_faces=False)
         except Exception:
             pass
 
     def _on_step_preview(self, mesh):
-        self.viewer.set_mesh(mesh, show_boundary=False, show_bad_faces=False)
+        self.viewer.set_mesh(mesh, show_boundary=False, show_bad_faces=False, show_faces=False)
         self.viewer.title_label.setText("预览：转换结果（STEP 实体）")
 
     def _on_progress(self, cur, total):

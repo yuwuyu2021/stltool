@@ -92,6 +92,7 @@ class GLCADViewWidget(QtWidgets.QWidget):
         # 自动 360° 环绕旋转（围绕 fit_view 设定的模型中心）
         self.orbit_enabled = True
         self._orbit_step_deg = 0.4
+        self._orbit_repaint_pending = False
         self._orbit_timer = QTimer(self)
         self._orbit_timer.setInterval(30)
         self._orbit_timer.timeout.connect(self._orbit_tick)
@@ -102,11 +103,18 @@ class GLCADViewWidget(QtWidgets.QWidget):
         if step_deg is not None:
             self._orbit_step_deg = float(step_deg)
 
+    def _orbit_release(self):
+        self._orbit_repaint_pending = False
+
     def _orbit_tick(self):
         try:
             if self.orbit_enabled and self.mesh_item is not None and self.view.opts is not None:
                 self.view.opts["azimuth"] = self.view.opts.get("azimuth", 0.0) + self._orbit_step_deg
-                self.view.update()
+                # 合并重绘：避免连续 update() 触发重绘风暴阻塞事件循环
+                if not self._orbit_repaint_pending:
+                    self._orbit_repaint_pending = True
+                    self.view.update()
+                    QTimer.singleShot(0, self._orbit_release)
         except Exception:
             pass
 

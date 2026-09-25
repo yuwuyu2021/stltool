@@ -1,4 +1,5 @@
 import sys
+import multiprocessing as mp
 
 from PyQt6.QtWidgets import QApplication
 
@@ -7,6 +8,7 @@ from stl_tool.app import MainWindow
 
 
 def main():
+    mp.freeze_support()
     app = QApplication(sys.argv)
     app.setApplicationName("STLTool")
     app.setApplicationVersion(VERSION)
