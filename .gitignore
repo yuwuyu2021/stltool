@@ -8,6 +8,9 @@ dist_min/
 build_min/
 assets/
 LOGO/
+STLs/
+stls_*.log
+param_only.log
 _diag/
 *.step
 *.stp

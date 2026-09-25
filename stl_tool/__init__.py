@@ -1,2 +1,2 @@
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 APP_NAME = "STL 转 STEP 工具"
