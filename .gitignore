@@ -7,6 +7,7 @@ build/
 dist_min/
 build_min/
 assets/
+LOGO/
 _diag/
 *.step
 *.stp
