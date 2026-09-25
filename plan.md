@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.6.1
+当前版本：v0.6.2
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -77,3 +77,4 @@
 - v0.5.0：**M8 非圆孔圆角化**——`hole_is_obround` 腰型孔检测（点到"两直段+两端圆弧"边界距离 RMS ≤0.3r + 面积一致性 ≥90%），`make_obround_cut` 用 `MakeEdge` 直线 + `MakeEdge(gp_Circ,P1,P2)` 圆弧构造解析切除体；**修复板件全局平移 bug**（origin 误叠 uv centroid）。侧板A 186→168 面、valid、误差 +0.18%；合成腰型孔板 536→10 面（8 平面+2 解析圆柱端面）、误差 ~0%。新增测试 `test_convert_parametric_obround`（14 测试全绿）。
 - v0.6.0：**根治"STEP 在 CAD 显示为空壳"**——定位：`BRepPrimAPI_MakePrism`（本 OCP 绑定）生成两个端面 cap 拓扑方向恒相同，必有一张 cap 朝内（侧板A parametric 168 面中 24 面与源 STL 法向反向、CAD 背面剔除显示空壳）。已尝试 `BRepLib.OrientClosedSolid_s`/`ShapeFix_Solid`/`BRepAlgoAPI_Sewing`（后者绑定不存在）均无效——OCC 认为壳 edge-consistent 而拒改。最终方案：新增 `_extrude_manual` **手工壳组装挤出**——BRep_Builder 共享顶点/边逐个构建底、顶与侧面平面（自然法向由 `BRepBuilderAPI_MakeFace` 自动化，引用方向由壳组装时按外法向选 FWD/REV；侧面外法向用"环走向符号"几何公式 `sgn>0:(dy,-dx)/sgn<0:(-dy,dx)`，修复形心判据对凹轮廓失效、相邻面方向错乱致体积偏大 29% 的问题）。`_extrude_solid` 外层环挤出改走新路径（失败回退旧 MakePrism）。实测：**侧板A parametric STEP 168 面朝外 168/168（100%）、与源 STL 反向 24→1、valid、体积误差 +0.18% 不变**；box POC 尺寸/体积精确、全朝外；14 测试全绿；批量回归正常（其余样本不受影响）。**用户 CAD 打开验收确认符合需求**。本地 Git 领先 origin 7 提交（推送因 GitHub 代理不通暂缓）。
 - v0.6.1：修复 `detect_plate` 体积校验回退分支 `_wmed` **面积加权中位崩溃**（真实样本"修改为ECAS04鲍登头 x4"触发 `IndexError: index 873 out of bounds` 与维度不匹配 `(1170,) vs (1573,)`）：权重用面面积、值却错用顶点 z 数组，且 NaN/浮点累积可使 `searchsorted` 返回 n 越界。改为面级中心 z `cz=(v[faces].mean(1))@axis` 配 `area_faces`，`_wmed` 内部过滤非有限值并钳制索引。鲍登头 parametric 由崩溃→正常出 STEP（valid）；新增 11 个真实 STL 样本入 `stl/new_case`（侧板A 命中 plate 168 面，其余合理 fallback）；14 测试全绿。
+- v0.6.2：`cli_batch.py` 新增 `--recursive` 递归批量（子目录 STEP 镜像输出目录结构），`process_file` 支持 `out_rel`。**49 件真实零件批量实测**（NEMA14/NEMA17 × MetalPlates/Printed）——parametric **命中 30/49**：板件 plate 21（Clamp/Plate 系列全部，面数 9→21 级、体积误差多数 <13%）、回转体 revolve 9（FrontMidBody 等 9-22 面）；回退 19（弹簧拉紧器/间隔圈等复杂件，全部 valid、体积误差 ~0%）。待关注 2 件体积误差 ≥25%（14_FrontMidBody +25.6%、14_Front_Plate_Spacer -26.0%，疑回转体误判）。**用户 logo 资产 LOGO/ 已从仓库移除并入 gitignore**（不上传 GitHub）。

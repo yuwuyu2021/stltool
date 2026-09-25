@@ -4,7 +4,7 @@
 统计实体有效性、面数、体积误差，可导出 STEP，用于对比参数化重建的降面效果。
 
 用法：
-    python cli_batch.py <stl目录或单个stl文件> [--out <输出目录>]
+    python cli_batch.py <stl目录或单个stl文件> [--out <输出目录>] [--recursive]
 """
 
 import os
@@ -43,7 +43,7 @@ def make_result(mesh, mode, tolerance=0.05):
     return r, None
 
 
-def process_file(path, out_dir=None, tolerance=0.05, write_steps=True):
+def process_file(path, out_dir=None, tolerance=0.05, write_steps=True, out_rel=None):
     name = os.path.basename(path)
     try:
         mesh = trimesh.load(path, force="mesh")
@@ -84,7 +84,9 @@ def process_file(path, out_dir=None, tolerance=0.05, write_steps=True):
             shapes = [s for s, v in r.shapes if v]
             comp = make_compound(*shapes)
             stem = os.path.splitext(name)[0]
-            out_path = os.path.join(out_dir, "{}__{}.step".format(stem, mode))
+            out_sub = os.path.join(out_dir, out_rel) if out_rel else out_dir
+            os.makedirs(out_sub, exist_ok=True)
+            out_path = os.path.join(out_sub, "{}__{}.step".format(stem, mode))
             ok, msg = write_step(comp, out_path, schema="AP214IS", write_pcurves=True)
             print("       {:s}".format("OK -> " + out_path if ok else "导出失败: " + msg))
     print()
@@ -99,6 +101,7 @@ def main():
 
     target = args[0]
     out_dir = None
+    recursive = "--recursive" in opts or "-r" in opts
     if "--out" in opts:
         i = opts.index("--out")
         if i + 1 < len(args):
@@ -112,12 +115,21 @@ def main():
             args.remove(args[i + 1])
 
     if os.path.isdir(target):
-        files = [os.path.join(target, f) for f in sorted(os.listdir(target))
-                 if f.lower().endswith(".stl")]
+        if recursive:
+            files = []
+            for root, _dirs, names in os.walk(target):
+                for f in sorted(names):
+                    if f.lower().endswith(".stl"):
+                        files.append(os.path.join(root, f))
+            files.sort()
+        else:
+            files = [os.path.join(target, f) for f in sorted(os.listdir(target))
+                     if f.lower().endswith(".stl")]
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
         for f in files:
-            process_file(f, out_dir, tolerance=tol)
+            rel = os.path.relpath(os.path.dirname(f), target)
+            process_file(f, out_dir, tolerance=tol, out_rel=None if rel == "." else rel)
     elif os.path.isfile(target):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
