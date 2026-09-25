@@ -1049,11 +1049,19 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
             # 计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
             # 多于主体板面）拉偏 → 面积加权中位把权重回归主体大平面
             def _wmed(d_vals, w_vals):
-                i = np.argsort(d_vals)
-                cw = np.cumsum(w_vals[i])
-                return float(d_vals[i][np.searchsorted(cw, cw[-1] * 0.5)])
-            wa_other = _wmed(z_o, mesh.area_faces[other])
-            wa_side = _wmed(z_s, mesh.area_faces[side])
+                msk = np.isfinite(d_vals) & (w_vals > 0)
+                d = np.asarray(d_vals, dtype=np.float64)[msk]
+                w = np.asarray(w_vals, dtype=np.float64)[msk]
+                if d.size == 0 or w.sum() <= 0:
+                    return np.nan
+                i = np.argsort(d)
+                cw = np.cumsum(w[i])
+                k = int(np.searchsorted(cw, cw[-1] * 0.5))
+                k = min(k, d.size - 1)
+                return float(d[i][k])
+            cz = (v[mesh.faces].mean(axis=1)) @ axis
+            wa_other = _wmed(cz[other], mesh.area_faces[other])
+            wa_side = _wmed(cz[side], mesh.area_faces[side])
             z_other2 = max(wa_other, wa_side)
             z_surf2 = min(z_surf, z_other2 - thickness)
             t2 = abs(z_other2 - z_surf2)
