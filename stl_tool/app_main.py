@@ -1,7 +1,7 @@
 """自举环境下的应用入口：无控制台的 pythonw 直接执行本模块来启动 GUI。"""
 import sys
 
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 
 from stl_tool import APP_NAME, VERSION
 from stl_tool.app import MainWindow

@@ -1,8 +1,8 @@
 import sys
 import multiprocessing as mp
 
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
 
 from stl_tool import VERSION, app_icon_path
 from stl_tool.app import MainWindow

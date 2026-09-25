@@ -4,9 +4,9 @@ import time
 
 import numpy as np
 import trimesh
-from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QFont, QKeySequence, QAction
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QAction
+from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QStatusBar, QVBoxLayout, QWidget,
@@ -100,11 +100,11 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
 
 
 class BatchWorker(QThread):
-    log_msg = pyqtSignal(str)
-    preview = pyqtSignal(object)      # 当前文件 STL 网格（trimesh）
-    step_preview = pyqtSignal(object) # 当前文件 STEP 结果预览网格（trimesh）
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(dict)
+    log_msg = Signal(str)
+    preview = Signal(object)      # 当前文件 STL 网格（trimesh）
+    step_preview = Signal(object) # 当前文件 STEP 结果预览网格（trimesh）
+    progress = Signal(int, int)
+    finished = Signal(dict)
 
     def __init__(self, files, src_dir, out_dir, schema="AP214IS", write_pcurves=True, parent=None):
         super().__init__(parent)

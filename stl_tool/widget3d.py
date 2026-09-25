@@ -1,8 +1,8 @@
 import numpy as np
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl.shaders import FragmentShader, ShaderProgram, VertexShader
-from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt as QtCoreQt, pyqtSignal, QTimer
+from PySide6 import QtWidgets
+from PySide6.QtCore import Qt as QtCoreQt, Signal, QTimer
 
 
 def boundary_edges_of(mesh):
@@ -60,7 +60,7 @@ class GLCADViewWidget(QtWidgets.QWidget):
     可显示 STL 三角网格或 OCC STEP 实体状。
     """
 
-    facePicked = pyqtSignal(int, object)  # 发射 (被点选的三角面索引, 命中 3D 点)；空白处为 (-1, None)
+    facePicked = Signal(int, object)  # 发射 (被点选的三角面索引, 命中 3D 点)；空白处为 (-1, None)
 
     def __init__(self, parent=None, title="预览"):
         super().__init__(parent)
@@ -250,9 +250,9 @@ class GLCADViewWidget(QtWidgets.QWidget):
         self.view.opts["center"] = center
 
     def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent
-        from PyQt6.QtCore import Qt as Q
-        from PyQt6.QtWidgets import QWidget
+        from PySide6.QtCore import QEvent
+        from PySide6.QtCore import Qt as Q
+        from PySide6.QtWidgets import QWidget
 
         if obj is self.view and event.type() == QEvent.Type.MouseButtonRelease:
             ev = event

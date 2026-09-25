@@ -17,8 +17,8 @@ datas += ocp_datas
 binaries += ocp_binaries
 hiddenimports += ocp_hidden
 
-# ---- PyQt6 全量收集（含 qt 插件/可执行程序） ----
-qt_datas, qt_binaries, qt_hidden = collect_all('PyQt6')
+# ---- PySide6 全量收集（含 Qt 插件/可执行程序） ----
+qt_datas, qt_binaries, qt_hidden = collect_all('PySide6')
 datas += qt_datas
 binaries += qt_binaries
 hiddenimports += qt_hidden
