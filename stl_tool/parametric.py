@@ -783,10 +783,13 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
     outer_loop = list(poly2d.exterior.coords)
     if outer_loop[0] == outer_loop[-1]:
         outer_loop = outer_loop[:-1]
-    f = face_of(outer_loop)
-    if f is None:
-        return None
-    solid = BRepPrimAPI_MakePrism(f, gp_Vec(*height_vec)).Shape()
+    solid = _extrude_manual(outer_loop, basis, origin, height_vec, rdp_eps)
+    if solid is None:
+        # 回退：旧 MakePrism 路径（cap 朝向 bug 存在，但保证兜底可用）
+        f = face_of(outer_loop)
+        if f is None:
+            return None
+        solid = BRepPrimAPI_MakePrism(f, gp_Vec(*height_vec)).Shape()
 
     n_circ = 0
     n_ob = 0
@@ -815,6 +818,166 @@ def _extrude_solid(poly2d, basis, origin, height_vec, plane_normal=None,
     if not _valid(solid):
         return None
     return solid
+
+
+def _extrude_manual(outer_loop, basis, origin, height_vec, rdp_eps=0.2):
+    """手工壳组装挤出板件实体（替代 MakePrism，规避后者的 cap 朝向 bug）。
+
+    输入 uv 平面外环，输出 valid 且全体面朝外的实体：
+      - 底面/顶面与侧面全部解析平面（直线边，与 STL 简化轮廓一致）
+      - 全部边/顶点拓扑共享（BRep_Builder 手工组装）
+      - 面朝向：以自然法向效应对齐外法向（BRepBuilderAPI_MakeFace
+        对该 OCP 版本会自动化 wire 方向，故引用级方向由 shell 组装时控制）
+    失败返回 None。
+    """
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeSolid
+    from OCP.TopoDS import (
+        TopoDS, TopoDS_Shape, TopoDS_Vertex, TopoDS_Edge,
+        TopoDS_Wire, TopoDS_Face, TopoDS_Shell,
+    )
+    from OCP.gp import gp_Pnt, gp_Ax1, gp_Dir
+    from OCP.Geom import Geom_Line, Geom_TrimmedCurve
+    from OCP.TopAbs import TopAbs_FORWARD, TopAbs_REVERSED
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomLProp import GeomLProp_SLProps
+    from OCP.BRep import BRep_Tool
+
+    bb = BRep_Builder()
+
+    def _or(s, o):
+        return s.Oriented(o)
+
+    pts = np.asarray(outer_loop, dtype=np.float64)
+    if rdp_eps and len(pts) > 8:
+        pts = _loop_rdp(pts, rdp_eps)
+    n = len(pts)
+    if n < 3:
+        return None
+    hv = np.asarray(height_vec, dtype=np.float64)
+    b3 = [tuple(origin + basis[0] * p[0] + basis[1] * p[1]) for p in pts]
+    t3 = [tuple(np.asarray(p) + hv) for p in b3]
+
+    vm = {}
+
+    def vget(vid, pt):
+        if vid not in vm:
+            v = TopoDS.Vertex_s(TopoDS_Shape())
+            bb.MakeVertex(v, gp_Pnt(*pt), 1e-9)
+            vm[vid] = v
+        return vm[vid]
+
+    def mk_edge(pid1, pid2, p1, p2):
+        import math
+        v1 = vget(pid1, p1)
+        v2 = vget(pid2, p2)
+        dx = p2[0] - p1[0]; dy = p2[1] - p1[1]; dz = p2[2] - p1[2]
+        L = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if L < 1e-9:
+            return None
+        curve = Geom_TrimmedCurve(
+            Geom_Line(gp_Ax1(gp_Pnt(*p1), gp_Dir(dx / L, dy / L, dz / L))), 0.0, L)
+        e = TopoDS.Edge_s(TopoDS_Shape())
+        bb.MakeEdge(e, curve, 1e-9)
+        bb.Add(e, _or(v1, TopAbs_FORWARD))
+        bb.Add(e, _or(v2, TopAbs_REVERSED))
+        bb.UpdateVertex(v1, 0.0, e, 1e-9)
+        bb.UpdateVertex(v2, L, e, 1e-9)
+        return e
+
+    def face_from(refs):
+        w = TopoDS.Wire_s(TopoDS_Shape())
+        bb.MakeWire(w)
+        for e, o in refs:
+            oo = TopAbs_FORWARD if o == 1 else TopAbs_REVERSED
+            bb.Add(w, _or(e, oo))
+        mf = BRepBuilderAPI_MakeFace(w, True)
+        if not mf.IsDone():
+            return None
+        return mf.Face()
+
+    def face_normal(face):
+        ad = BRepAdaptor_Surface(face)
+        pr = GeomLProp_SLProps(
+            BRep_Tool.Surface_s(face),
+            0.5 * (ad.FirstUParameter() + ad.LastUParameter()),
+            0.5 * (ad.FirstVParameter() + ad.LastVParameter()), 1, 1e-9)
+        if not pr.IsNormalDefined():
+            return None
+        nm = np.array([pr.Normal().X(), pr.Normal().Y(), pr.Normal().Z()])
+        ln = np.linalg.norm(nm)
+        if ln < 1e-9:
+            return None
+        nm = nm / ln
+        if face.Orientation() == TopAbs_REVERSED:
+            nm = -nm
+        return nm
+
+    def add_face(shell, face, want):
+        nm = face_normal(face)
+        if nm is None:
+            return False
+        oo = TopAbs_FORWARD if np.dot(nm, want) >= 0 else TopAbs_REVERSED
+        bb.Add(shell, _or(face, oo))
+        return True
+
+    base_edges = []
+    top_edges = []
+    vert_edges = []
+    for i in range(n):
+        j = (i + 1) % n
+        be = mk_edge('b%d' % i, 'b%d' % j, b3[i], b3[j])
+        ce = mk_edge('t%d' % i, 't%d' % j, t3[i], t3[j])
+        ve = mk_edge('b%d' % i, 't%d' % i, b3[i], t3[i])
+        if be is None or ce is None or ve is None:
+            return None
+        base_edges.append(be)
+        top_edges.append(ce)
+        vert_edges.append(ve)
+
+    hv_u = hv / np.linalg.norm(hv)
+    base = face_from([(base_edges[i], 1) for i in range(n)])
+    cap = face_from([(top_edges[i], 1) for i in range(n)])
+    if base is None or cap is None:
+        return None
+
+    shell = TopoDS.Shell_s(TopoDS_Shape())
+    bb.MakeShell(shell)
+    if not add_face(shell, base, -hv_u) or not add_face(shell, cap, hv_u):
+        return None
+
+    cen = (np.array(b3).mean(axis=0) + np.array(t3).mean(axis=0)) / 2.0
+    # 环走向符号：CCW(+) 时外部法向=边向量顺时针转 90°（dy,-dx）
+    sa = sum(b3[i][0] * b3[(i + 1) % n][1] - b3[i][1] * b3[(i + 1) % n][0]
+             for i in range(n))
+    sgn = 1.0 if sa > 0 else -1.0
+    for i in range(n):
+        j = (i + 1) % n
+        d = np.asarray(b3[j]) - np.asarray(b3[i])
+        if sgn > 0:
+            o = np.array([d[1], -d[0], 0.0])
+        else:
+            o = np.array([-d[1], d[0], 0.0])
+        ln = np.linalg.norm(o)
+        if ln < 1e-9:
+            o = hv_u
+        else:
+            o = o / ln
+            # 无孔外环，朝外即远离环内——检查兜底：若水平角 90° 内无分量则退化
+            if o[0] * o[0] + o[1] * o[1] < 1e-12:
+                o = hv_u
+        side = face_from([(base_edges[i], 1), (vert_edges[j], 1),
+                          (top_edges[i], -1), (vert_edges[i], -1)])
+        if side is None:
+            return None
+        if not add_face(shell, side, o):
+            return None
+
+    ms = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(shell))
+    ms.Build()
+    if not ms.IsDone():
+        return None
+    return ms.Shape()
 
 
 def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
