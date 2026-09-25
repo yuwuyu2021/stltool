@@ -1,45 +1,72 @@
 # STL 转可编辑实体 STEP 工具
 
-将 STL 三角网格文件转换为 CAD 软件可打开、可编辑的 STEP（B-Rep）实体文件。
+> 把 3D 打印 / 建模用的 STL 网格文件，自动转换成 CAD 软件（SolidWorks、Fusion 360、FreeCAD 等）**可以打开、可以直接修改**的 STEP 实体文件。
 
-## 特性
-- **自动网格分析**：闭合性（watertight）、流形、开放边界边数、体积、表面积、连通片数、退化面/重复面/法向异常面检测
-- **自动转换策略**：闭合网格→直接缝合为实体；开放网格→自动补孔后重建；无法闭合→降级导出开放壳并提示
-- **实体校验**：导出前使用 BRepCheck 验证实体有效性
-- **可编辑 STEP**：导出 AP203 / AP214 标准，支持曲面曲线（pcurve）
-- **完整 GUI**：STL 拖放/打开、OpenGL 3D 预览、边界/法向异常高亮、实时日志、后台转换不卡界面
+STL 只是一层"薄壳"，用 CAD 打开既不能编辑也不好改尺寸；STEP 是真正的实体（Solid）。
+本工具读取 STL 后**自动选择最合适的重建方式**（薄板带孔 / 回转体 / 基本体素 / 面拟合），一键输出准确的 STEP 实体，全程无需任何设置。
 
-## 安装
-需要 Python 3.9+（本仓库开发于 Python 3.14）。
+---
+
+## 🚀 最快上手：直接下载发布包（推荐）
+
+不需要安装 Python，也不需要任何环境：
+
+1. 打开 **GitHub Releases 发布页**：[github.com/yuwuyu2021/stltool/releases](https://github.com/yuwuyu2021/stltool/releases)
+2. 在最新版本（latest）的资产（Assets）中下载：
+   **`STLTool-v0.6.x-win64-singlefile.exe`**（约 280 MB，已包含全部依赖）
+3. 双击运行即可（首次启动需要解压，等待几秒是正常的）
+
+> 单文件版本无需联网、无需安装。若系统提示"未知来源"，点击"仍要运行"即可。
+
+## 🧭 界面怎么用（三步）
+
+1. **选择输入**——点「选择文件…」选一个 `.stl`，或点「选择目录(批量)…」一次转换一个文件夹里的**全部 STL**（支持子目录）。
+2. **选择输出目录**——转换后的 `.step` 文件将写到这里，并保持原目录结构。
+3. **点「开始转换」**。
+
+剩下的全自动：
+
+- 自动清洗网格：补孔、修复法向、清理退化面；
+- 自动选择重建方式，未命中时自动回退面拟合；
+- 上方的 3D 预览会**围绕模型中心自动 360° 旋转**，可随时手动拖拽查看；
+- 下方的日志实时输出每个文件的详细转换过程；
+- 全部完成后显示**汇总**（成功 / 失败数量、耗时、输出位置）。
+
+---
+
+## 🛠 从源码运行（开发者 / 二次开发）
+
+环境要求：Windows + Python 3.9+。
+
 ```bash
+git clone https://github.com/yuwuyu2021/stltool.git
+cd stltool
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## 运行
-```bash
 python main.py
 ```
 
-## 测试
+跑测试：
+
 ```bash
-python tests\test_core.py
+pytest tests -q
 ```
 
-## 使用方法
-1. 打开或拖入一个 `.stl` 文件，左侧自动显示网格分析结果
-2. 在右侧 3D 视图中检查网格（红色边 = 开放边界，黄色面 = 法向异常）
-3. 调整转换设置（补孔、修复法向、清理退化面、缝合容差）
-4. 点击“转换为实体”预览结果，或直接“导出 STEP 文件”
+## 📚 技术栈
 
-## 技术栈
-- `trimesh` —— STL 读取、拓扑与质量分析、孔洞修补
-- `cadquery-ocp` (OCP) —— OpenCASCADE 官方 Python 绑定，B-Rep 实体构建与 STEP 导出
-- `PyQt6` + `pyqtgraph` —— GUI 与 OpenGL 3D 预览
+| 组件 | 用途 |
+| --- | --- |
+| `trimesh` | STL 读取、网格分析、孔洞修补 |
+| `cadquery-ocp` (OCP) | OpenCASCADE 官方绑定：B-Rep 实体构建与 STEP 导出 |
+| `shapely` + `mapbox-earcut` | 薄板轮廓三角化 |
+| `PyQt6` + `pyqtgraph` (+`PyOpenGL`) | 界面与 OpenGL 3D 预览 |
 
-## 当前版本
-v0.2.0
+## 🆕 更新与反馈
 
-详见 `plan.md`。
+- 新版本一律发布在 **GitHub Releases**：<https://github.com/yuwuyu2021/stltool/releases>
+- 有问题或建议，欢迎到仓库提 Issue：<https://github.com/yuwuyu2021/stltool/issues>
 
-### 许可证
+## 📄 许可证
+
 [MIT](LICENSE)

@@ -2,7 +2,7 @@ import numpy as np
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl.shaders import FragmentShader, ShaderProgram, VertexShader
 from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt as QtCoreQt, pyqtSignal
+from PyQt6.QtCore import Qt as QtCoreQt, pyqtSignal, QTimer
 
 
 def boundary_edges_of(mesh):
@@ -88,6 +88,27 @@ class GLCADViewWidget(QtWidgets.QWidget):
             "color:#444; font-weight:bold; background:#e6e7e9; padding:0px; border:1px solid #bbb;"
         )
         layout.insertWidget(0, self.title_label)
+
+        # 自动 360° 环绕旋转（围绕 fit_view 设定的模型中心）
+        self.orbit_enabled = True
+        self._orbit_step_deg = 0.4
+        self._orbit_timer = QTimer(self)
+        self._orbit_timer.setInterval(30)
+        self._orbit_timer.timeout.connect(self._orbit_tick)
+        self._orbit_timer.start()
+
+    def set_orbit(self, enabled, step_deg=None):
+        self.orbit_enabled = bool(enabled)
+        if step_deg is not None:
+            self._orbit_step_deg = float(step_deg)
+
+    def _orbit_tick(self):
+        try:
+            if self.orbit_enabled and self.mesh_item is not None and self.view.opts is not None:
+                self.view.opts["azimuth"] = self.view.opts.get("azimuth", 0.0) + self._orbit_step_deg
+                self.view.update()
+        except Exception:
+            pass
 
     def _setup_grid(self):
         """添加 CAD 风格的地面网格表线。"""
