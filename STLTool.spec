@@ -32,10 +32,15 @@ datas += tm_datas
 binaries += tm_binaries
 hiddenimports += tm_hidden
 
+# ---- shapely（parametric 板件重建依赖）----
+sh_datas, sh_binaries, sh_hidden = collect_all('shapely')
+datas += sh_datas
+binaries += sh_binaries
+hiddenimports += sh_hidden
+
 # 显式补充 trimesh 常用依赖子模块（PyInstaller 静态分析往往遗漏）
 hiddenimports += [
     'trimesh.repair',
-    'trimesh.loaders',
     'trimesh.creation',
     'trimesh.graph',
     'trimesh.grouping',
@@ -51,8 +56,10 @@ hiddenimports += [
     'stl_tool.pipeline',
     'stl_tool.solid_builder',
     'stl_tool.mesh_analyzer',
+    'stl_tool.mesh_editor',
+    'stl_tool.parametric',
+    'stl_tool.analytic',
     'stl_tool.step_exporter',
-    'stl_tool.util',
 ]
 
 a = Analysis(
@@ -88,5 +95,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='LOGO/logo.ico',
+    icon='assets/icon.ico',
 )
