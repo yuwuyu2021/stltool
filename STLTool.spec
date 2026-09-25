@@ -8,6 +8,9 @@ datas = []
 binaries = []
 hiddenimports = core_imports = []
 
+# 运行时窗口图标（打包后亦随 exe 解包生效）
+datas += [('assets/icon.ico', 'assets')]
+
 # ---- OCP (OpenCASCADE 绑定，96MB+) 全量收集 ----
 ocp_datas, ocp_binaries, ocp_hidden = collect_all('OCP')
 datas += ocp_datas
