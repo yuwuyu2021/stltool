@@ -243,6 +243,13 @@ class MainWindow(QMainWindow):
         self.chk_analytic.setToolTip("把共面/同向的平面三角区拟合成单一平面面，其余区域逐三角缝合；"
                                      "适合平面为主的机械件，可显著减少实体面数。")
         ev.addWidget(self.chk_analytic)
+        self.chk_param = QCheckBox("参数化重建（优先：板件/回转体/体素）")
+        self.chk_param.setChecked(False)
+        self.chk_param.setToolTip("优先整体识别为带孔薄板/回转体/基本体素重建（实体面数可降 90%+）；"
+                                  "无法命中时自动回退面拟合/逐三角。勾选后将取消“面拟合导出”。")
+        ev.addWidget(self.chk_param)
+        self.chk_analytic.toggled.connect(lambda on: on and self.chk_param.setChecked(False))
+        self.chk_param.toggled.connect(lambda on: on and self.chk_analytic.setChecked(False))
         lv.addWidget(exp_grp)
 
         self.btn_convert = QPushButton("转换为实体")
@@ -522,6 +529,7 @@ class MainWindow(QMainWindow):
         o.remove_degenerate = self.chk_deg.isChecked()
         o.tolerance = self.spin_tol.value()
         o.analytic = self.chk_analytic.isChecked()
+        o.parametric = self.chk_param.isChecked()
         return o
 
     def current_schema(self):
@@ -602,6 +610,39 @@ class MainWindow(QMainWindow):
         lines.append("实体: {} | 开放壳: {} | 无效形状: {}".format(
             r.solid_count, r.shell_count, r.invalid_count))
         lines.append(r.message)
+        if r.solid_count > 0:
+            shapes = [s for s, v in r.shapes if v]
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
+            n_new = 0
+            for sh in shapes:
+                e = TopExp_Explorer(sh, TopAbs_FACE)
+                while e.More():
+                    n_new += 1
+                    e.Next()
+            n_old = len(self.mesh.faces) if self.mesh is not None else 0
+            comp = make_compound(*shapes) if len(shapes) > 1 else shapes[0]
+            pr = GProp_GProps()
+            BRepGProp.VolumeProperties_s(comp, pr)
+            vol_step = pr.Mass()
+            vol_mesh = float(self.mesh.volume) if self.mesh is not None and self.mesh.volume else None
+            if n_old > 0:
+                pct = 100.0 * (1.0 - n_new / float(n_old))
+                lines.append("—— 重建效果对比 ——")
+            else:
+                pct = None
+                lines.append("—— 重建效果对比 ——")
+            kind = getattr(r, "param_type", "") or ("analytic" if self.chk_analytic.isChecked() else "逐三角")
+            info = "重建方式: {}".format(kind or "—")
+            if n_old > 0 and pct is not None:
+                info += " | 面数 {} → {}（-{:.1f}%）".format(n_old, n_new, pct)
+            info += " | 无效形状 {}".format(r.invalid_count)
+            if vol_mesh:
+                err = (vol_step - vol_mesh) / vol_mesh * 100.0 if vol_mesh > 0 else float("nan")
+                info += " | 体积 网格 {:.3f} / STEP {:.3f}（{:+.1f}%）".format(vol_mesh, vol_step, err)
+            lines.append(info)
         self.analysis_box.setPlainText("\n".join(lines))
 
         step_path = report.get("step_path")
