@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.6.6
+当前版本：v0.7.1
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -80,3 +80,4 @@
 - v0.6.2：`cli_batch.py` 新增 `--recursive` 递归批量（子目录 STEP 镜像输出目录结构），`process_file` 支持 `out_rel`。**49 件真实零件批量实测**（NEMA14/NEMA17 × MetalPlates/Printed）——parametric **命中 30/49**：板件 plate 21（Clamp/Plate 系列全部，面数 9→21 级、体积误差多数 <13%）、回转体 revolve 9（FrontMidBody 等 9-22 面）；回退 19（弹簧拉紧器/间隔圈等复杂件，全部 valid、体积误差 ~0%）。待关注 2 件体积误差 ≥25%（14_FrontMidBody +25.6%、14_Front_Plate_Spacer -26.0%，疑回转体误判）。**用户 logo 资产 LOGO/ 已从仓库移除并入 gitignore**（不上传 GitHub）。
 - v0.6.3：`STLs/` 目录与批量日志文件加入 gitignore（用户 STL 不入库）；清理临时日志。
 - v0.6.4：**GUI 接入参数化重建 + 结果对比面板**——导出设置新增「参数化重建（优先：板件/回转体/体素）」，与「面拟合 analytic」互斥；转换完成后分析面板展示增强：「重建效果对比」区块——重建方式 kind、源网格面数 vs 实体面数与降幅 %、无效形状数、网格体积 vs STEP 体积误差 %（导入 `_on_done` 实时计算）。offscreen 冒烟构建通过，14 测试全绿。
+- v0.7.1：使用 `project-github-avatar` 技能按项目名生成 GitHub identicon 风格图标（5×5 镜像像素图案 + 独立配色哈希），产出 512 PNG、SVG 与 16~256 八尺寸 ICO；`STLTool.spec` 与引导器 `STLTool_min.spec` 统一使用新图标，README 展示图标并纳入版本管理。

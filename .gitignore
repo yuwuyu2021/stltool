@@ -8,7 +8,10 @@ build.log
 build.err.log
 dist_min/
 build_min/
-assets/
+assets/*
+!assets/icon.ico
+!assets/icon.png
+!assets/icon.svg
 LOGO/
 STLs/
 stls_*.log

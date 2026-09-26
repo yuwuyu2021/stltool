@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import os
+import queue
 import time
 
 import numpy as np
@@ -30,12 +31,30 @@ def _step_out_path(src_file, src_dir, out_dir):
     return os.path.join(out_dir, rel + stem + ".step")
 
 
-def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
+def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queue=None):
     """在独立子进程中执行单个文件的完整转换（spawn 目标函数，须为模块顶层）。
 
     子进程拥有独立 GIL，长耗时重建不再阻塞 GUI 事件循环。
     返回可 Pickle 的汇总字典；预览用 trimesh 网格一并返回。
+    report_queue：可选的进程间队列，用于实时回传 (百分比, 阶段说明)，供界面展示进度。
     """
+
+    def rep(pct, msg):
+        if report_queue is not None:
+            try:
+                report_queue.put((int(pct), msg))
+            except Exception:
+                pass
+
+    def progress_cb(cur, total):
+        # 统一映射参数化检测/区域拟合/三角缝合的 (当前, 总量) 为 0-100 百分比
+        try:
+            if total and total > 0 and cur is not None and cur >= 0:
+                r = min(max(float(cur) / float(total), 0.0), 1.0)
+                rep(6 + 86 * r, "特征重建 {:d}/{:d}".format(int(cur), int(total)))
+        except Exception:
+            pass
+
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.GProp import GProp_GProps
@@ -45,23 +64,27 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
     from .step_exporter import write_step
 
     t1 = time.time()
+    rep(0, "读取 STL 网格 …")
     try:
         mesh = trimesh.load(src_file, force="mesh")
     except Exception as exc:
         return {"ok": False, "error": "读取失败：" + str(exc), "preview_mesh": None}
     if mesh is None or mesh.faces is None or len(mesh.faces) == 0:
         return {"ok": False, "error": "空网格", "preview_mesh": None}
+    rep(4, "网格量测 …")
     vol_mesh = float(mesh.volume) if mesh.is_watertight else None
 
+    rep(6, "参数化特征重建（清洗/点测/体素/回转/薄板）…")
     try:
         opts = ConvertOptions()
         opts.parametric = True  # 自动选择：参数化重建 → 未命中自动回退
-        res = convert(mesh, opts)
+        res = convert(mesh, opts, progress_cb=progress_cb)
         shapes = [s for s, v in res.shapes if v] or [s for s, _ in res.shapes]
         shape = make_compound(*shapes) if len(shapes) > 1 else (shapes[0] if shapes else None)
         if shape is None:
             raise RuntimeError("没有可导出的实体形状。")
         out = _step_out_path(src_file, src_dir, out_dir)
+        rep(93, "导出 STEP 实体 …")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         ok_w, msg = write_step(shape, out, schema=schema, write_pcurves=write_pcurves)
         if not ok_w:
@@ -79,6 +102,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
     pr = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, pr)
     vol_step = pr.Mass()
+    rep(96, "生成预览网格 …")
     step_mesh = None
     try:
         sm = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
@@ -86,6 +110,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves):
             step_mesh = sm
     except Exception:
         pass
+    rep(99, "转换完成")
     return {
         "ok": True,
         "out_path": out,
@@ -117,20 +142,28 @@ class BatchWorker(QThread):
     def run(self):
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(1)  # 1 个转换子进程：界面进程 GIL 完全空闲，界面与旋转保持流畅
+        manager = ctx.Manager()
+        report_q = manager.Queue()  # 子进程实时回传 (百分比, 阶段说明)
         t0 = time.time()
         ok = failed = 0
         failed_files = []
         n = len(self.files)
         try:
             for i, f in enumerate(self.files):
-                self.progress.emit(i, n)
+                self.progress.emit(i * 100, n * 100)
                 self.log_msg.emit("-" * 62)
                 self.log_msg.emit("[{}/{}] 文件：{}".format(i + 1, n, os.path.basename(f)))
+                fut = pool.apply_async(_proc_convert, (f, self.src_dir, self.out_dir,
+                                                       self.schema, self.write_pcurves, report_q))
+                res = None
+                while not fut.ready():
+                    self._drain(report_q, i, n)
+                    time.sleep(0.03)
                 try:
-                    res = pool.apply(_proc_convert, (f, self.src_dir, self.out_dir,
-                                                     self.schema, self.write_pcurves))
+                    res = fut.get(timeout=5)
                 except Exception as exc:
                     res = {"ok": False, "error": "子进程异常：" + str(exc), "preview_mesh": None}
+                self._drain(report_q, i, n)
                 if res.get("ok"):
                     pm = res.get("preview_mesh")
                     if pm is not None:
@@ -157,16 +190,28 @@ class BatchWorker(QThread):
                     if pm is not None:
                         self.preview.emit(pm)
                     self.log_msg.emit("  转换失败：" + str(res.get("error", "")))
-            self.progress.emit(n, n)
+                self.progress.emit((i + 1) * 100, n * 100)
+            self.progress.emit(n * 100, n * 100)
         finally:
             pool.terminate()
             pool.join()
+            manager.shutdown()
         self.log_msg.emit("-" * 62)
         self.finished.emit({
             "total": n, "ok": ok, "failed": failed,
             "seconds": time.time() - t0, "out_dir": self.out_dir,
             "failed_files": failed_files,
         })
+
+    def _drain(self, report_q, i, n):
+        """把子进程回传的实时阶段消息取空并转发给界面。"""
+        try:
+            while True:
+                pct, msg = report_q.get_nowait()
+                self.log_msg.emit("    [{:>3d}%] {}".format(pct, msg))
+                self.progress.emit(i * 100 + pct, n * 100)
+        except queue.Empty:
+            pass
 
 
 class MainWindow(QMainWindow):
@@ -395,8 +440,9 @@ class MainWindow(QMainWindow):
         self.log("开始批量转换：共 {} 个文件 → {}".format(len(files), out))
         self._set_busy(True)
         self.progress.setVisible(True)
-        self.progress.setRange(0, len(files))
+        self.progress.setRange(0, len(files) * 100)
         self.progress.setValue(0)
+        self.progress.setFormat("文件 0/{0} · 0%".format(len(files)))
 
         self.worker = BatchWorker(files, src_dir, out)
         self.worker.log_msg.connect(self._on_worker_log)
@@ -421,6 +467,12 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, cur, total):
         self.progress.setValue(cur)
+        if total <= 0:
+            return
+        n_files = total // 100 or 1
+        fi = min(cur // 100 + 1, n_files)
+        pct = int(round(cur / total * 100))
+        self.progress.setFormat("文件 {}/{} · {}%".format(fi, n_files, pct))
 
     def _on_finished(self, d):
         self.progress.setVisible(False)
