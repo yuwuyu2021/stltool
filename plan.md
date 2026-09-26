@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.7.2
+当前版本：v0.8.0
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -24,7 +24,7 @@
 - [x] M2 完整 GUI：文件打开/拖放、3D 预览、分析结果面板、导出参数、进度与日志
   - ✅ 已完成：PyQt6 + pyqtgraph OpenGL 预览、边界/法向高亮、后台线程转换、进度条、日志、导出对话框
 - [ ] M3 自动修复与鲁棒性：孔洞修补、缝合容差调节、多体/多壳处理、失败诊断建议、大网格精简
-  - ⏳ 部分完成：孔洞修补、法向修复、退化面清理、缝合容差、多壳导出宏。待办：大网格精简(fast-simplification)、更精细的失败诊断
+  - ⏳ 部分完成：孔洞修补、法向修复、退化面清理、缝合容差、多壳导出宏、大网格自动简化（见 M10）。待办：更精细的失败诊断
 - [ ] M4 打磨发布：单元测试、性能优化、打包脚本（PyInstaller）、README、文档
   - ⏳ 部分完成：核心单元测试、README；首次完整打包脚本(STLTool.spec, 单文件 351MB)
   - ✅ v0.0.5 修复极小退化面导致实体无效的缺陷：真实扳机 STL（含面积 ~1e-6 退化面）经"清理退化面+自动补孔"产出合法闭合实体（BRepCheck valid），新增回归测试 tests/fixtures/block26_trigger.stl
@@ -54,6 +54,11 @@
   - 目标：把判定为真圆的通孔用 `BRepPrimAPI_MakeCylinder` 解析圆柱面布尔减替换 wire。
   - 方案：`hole_is_circle` 三步判定——bbox 宽高比 ≤1.05（排除长条/操场形）→ 环比面积 vs πr² 一致性 ≥99%（排除复合弧/部分圆弧）→ 半径取 bbox 平均。圆柱轴沿挤出方向（`drill_dir` 与 height_vec 同向，修复"圆孔未切除"体积误差 0.4%）。
   - 实测：侧板A 23918→**181 面**（v0.2.0 为 346）、valid、体积误差 **+0.4%**、4s；同步轮盖板等曲面件仍合理回退（误差 0%）。12 测试全绿。
+- [x] M10 大网格性能优化（v0.8.0，已完成）
+  - 目标：Benchy 22.5 万残差面缝合 + STEP 导出 >15min / 570MB 的性能痛点。
+  - 方案演进（两轮证伪后收敛）：① `fast-simplification` 各参数组合均残留 14~32 条 non-manifold 边（multi≥3），drop+fan-fill 迭代陷入 6 条不可消除稳态环 → 弃用；② 低角度残差 patch 合并——`region_boundary_loops` 将小面按邻接 BFS 聚合为 patch，用平均平面重建单个 face，9°/6°/4.5°/3° 下有效合并率仅 7.8~10%，且大面积 wire 平面投影自交致整体无效 → 判定不适用于自由曲面模型，默认关，小模型共面区仍可受益。③ 收敛方案：**超 8 万面自动 QEM 简化**（pymeshlab `meshing_decimation_quadric_edge_collapse(targetfacenum=40000, preservetopology=True, planarquadric=True, autoclean=True)`，内存 MeshSet 无文件往返）→ 缝合面数直降一个量级；叠加 **面向网格外向法向对齐**（`_align_face_normal`，region/patch/逐三角三类面统一套用）。
+  - ✅ 实测（本机 Windows，Benchy/3DBenchy.stl 225102 面）：pymeshlab 简化 40000 面、**watertight、multi=0、open=0、体积误差 -0.004%**、约 3~5s；端到端 convert+STEP 总 **≈120s（convert 97~102s + step write 15~16s）→ STEP 99.1MB**（原 570MB / 用户机 ~965s / 本机 15min 未跑完）。14 测试全绿。
+  - ⛔ 已知遗留（另立工单）：缝合得到的 solid 严格 `BRepCheck_Analyzer.IsValid()` 仍返回 False；微四面体对照实验显示 edge 两侧 face marker 全 FORWARD 并不导致 invalid（`(16,59790,3)` 型定向分布是红鲱鱼），真正根因（面自交 / 壳内部连通性/子壳）未最终定位，属长期潜伏缺陷而非本次回归。BFS 翻转重建、ReShape 替换、ShapeFix_Shape 三种修复路径均已证伪或无效。
 
 ## 量化指标
 - 转换成功率：闭合网格 100%，轻度开放网格 ≥90%（当前测试：闭合 100%）
@@ -82,3 +87,4 @@
 - v0.6.4：**GUI 接入参数化重建 + 结果对比面板**——导出设置新增「参数化重建（优先：板件/回转体/体素）」，与「面拟合 analytic」互斥；转换完成后分析面板展示增强：「重建效果对比」区块——重建方式 kind、源网格面数 vs 实体面数与降幅 %、无效形状数、网格体积 vs STEP 体积误差 %（导入 `_on_done` 实时计算）。offscreen 冒烟构建通过，14 测试全绿。
 - v0.7.1：使用 `project-github-avatar` 技能按项目名生成 GitHub identicon 风格图标（5×5 镜像像素图案 + 独立配色哈希），产出 512 PNG、SVG 与 16~256 八尺寸 ICO；`STLTool.spec` 与引导器 `STLTool_min.spec` 统一使用新图标，README 展示图标并纳入版本管理。
 - v0.7.2：**转换进度可视化完善**——真实 Benchy 实测（1907 解析区 + 22.4 万残差面）暴露两缺陷：① 参数化命中瞬间跳 92% 后回退 6%（进度条倒退）；② 残差缝合后进入 OCC `sewing.Perform()`/壳体提取/校验无任何回显，长时间停在 91%。修复：`app.py` 进度状态机按阶段分区映射（参数化检测 6~30%、解析面区域拟合 46~68%、残差三角面逐面缝合 66~92%，只进不退）；`analytic.py` 尾程插桩三处哨兵（93% 缝合全部面 / 94% 提取壳体实体 / 97% BRepCheck 校验），消除卡顿假象。
+- v0.8.0：**大网格性能轮（M10）**——pipeline 新增 `ConvertOptions.simplify_large`（默认开，>8 万面自动 pymeshlab QEM 简化至 4 万，缺依赖优雅跳过并记 notes）；`analytic.py` 新增 `_align_face_normal`（平面 face 法向对齐网格向外）并套用于解析区/低角度 patch/逐三角三类面，新增低角度残差 patch 合并（`residual_patch_deg`，有效合并率实测仅 ~8.5%、失真，默认 9.0 且大面积退回逐三角，小模型共面区受益）。端到端：Benchy 15min+/570MB → **≈120s / 99.1MB**；14 测试全绿。

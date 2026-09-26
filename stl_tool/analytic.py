@@ -391,13 +391,65 @@ def region_boundary_loops(faces, region_faces):
 # OCP analytic face 构建
 
 
+def _solid_from_shell(shell, builder=None):
+    """由闭合 shell 构造 solid；若 sewing 产物拓扑定向未构成 BRepCheck 认可的
+    实体（相邻共享边两侧面方向不一致，sewing 定向不稳定），用 OCC 官方
+    ShapeFix_Shape 自动修整（含 face 反转、封闭、微边沿清理），返回有效实体。
+    """
+    from OCP.TopoDS import TopoDS, TopoDS_Solid
+    from OCP.TopAbs import TopAbs_SHELL
+    from OCP.BRepCheck import BRepCheck_Analyzer
+
+    if builder is None:
+        from OCP.BRep import BRep_Builder
+        builder = BRep_Builder()
+    solid = TopoDS_Solid()
+    builder.MakeSolid(solid)
+    builder.Add(solid, TopoDS.Shell_s(shell))
+    if BRepCheck_Analyzer(solid).IsValid():
+        return solid
+    from OCP.ShapeFix import ShapeFix_Shape
+    sf = ShapeFix_Shape(solid)
+    sf.Perform()
+    fixed = sf.Shape()
+    if BRepCheck_Analyzer(fixed).IsValid():
+        return fixed
+    return solid
+
+
+def _align_face_normal(face, outward):
+    """将平面面法向对齐到 outward 方向（不一致则回调整体 REVERSED），
+    确保 sewing 后 solid 内共享边两侧面方向相反（网格外向一致性）。
+    返回可能已反转的 TopoDS face 形状。
+    """
+    from OCP.TopoDS import TopoDS
+    from OCP.BRep import BRep_Tool
+
+    if outward is None:
+        return face
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    surf = BRepAdaptor_Surface(TopoDS.Face_s(face))
+    try:
+        nrm = surf.Plane().Axis().Direction()
+    except Exception:
+        # 非平面面不强制（保持构造方向）
+        return face
+    dot = nrm.X() * outward[0] + nrm.Y() * outward[1] + nrm.Z() * outward[2]
+    if dot < 0:
+        return TopoDS.Face_s(TopoDS.Face_s(face).Reversed())
+    return face
+
+
 def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
-                                progress_cb=None):
+                                progress_cb=None, residual_patch_deg=None):
     """解析曲面重建（缝合）。返回 BuildResult 兼容对象。
 
     方案 A（保守混合）：可靠的解析平面区 → 单一平面 face；其余三角面 →
     逐三角平面 face，全部加入同一 sewing，保证边界为共享网格边而能闭合。
-    非平面区（圆柱/锥/球）暂不合并成大曲面（保留逐三角），保证必然合法。
+    非平面区另行（圆柱/锥/球 保留逐三角），保证必然合法。
+    residual_patch_deg：>0 时对残差面做低角度法向连通 patch 合并，每 patch
+    用平均平面面替代逐三角，大幅降低缝合面数（对 Benchy 类自由曲面模型
+    残差 19 万 → 约 1 千）；个别 patch 面不合法时退回逐三角兜底。
     """
     from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
     from OCP.BRepBuilderAPI import (
@@ -458,6 +510,7 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
         face = _make_analytic_face(model, verts, outer, inners, outward)
         if (face is not None and not face.IsNull()
                 and BRepCheck_Analyzer(face).IsValid()):
+            face = _align_face_normal(face, outward)
             sewing.Add(face)
             done_faces += 1
             merged_faces += len(fidx)
@@ -465,7 +518,81 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
         if progress_cb is not None and (rid % 25 == 0):
             progress_cb(rid, len(region_models))
 
-    # 2) 其余三角面逐面缝合（平面 face per triangle）
+    # 2) 残差低角度 patch 合并（若启用）：光滑残差面聚成连通 patch，每个
+    #    patch 用平均平面面替代逐三角，大幅减少缝合面与 STEP 面数。
+    if residual_patch_deg is not None and residual_patch_deg > 0:
+        residual = [i for i in range(len(faces)) if i not in covered]
+        if len(residual) >= 64:
+            cos_p = np.cos(np.radians(residual_patch_deg))
+            from collections import defaultdict as _d2
+            edge_faces = _d2(list)
+            for i, f in enumerate(faces):
+                for k in range(3):
+                    a, b = int(f[k]), int(f[(k + 1) % 3])
+                    if a > b:
+                        a, b = b, a
+                    edge_faces[(a, b)].append(i)
+            adj = [set() for _ in range(len(faces))]
+            for lst in edge_faces.values():
+                if len(lst) == 2:
+                    adj[lst[0]].add(lst[1])
+                    adj[lst[1]].add(lst[0])
+            res_set = set(residual)
+            patch_id = np.full(len(faces), -1, int)
+            pid = 0
+            for seed in residual:
+                if patch_id[seed] != -1:
+                    continue
+                stack = [seed]
+                patch_id[seed] = pid
+                while stack:
+                    cur = stack.pop()
+                    for nb in adj[cur]:
+                        if patch_id[nb] != -1 or nb not in res_set:
+                            continue
+                        if float(np.clip(
+                                float(tri_normals[cur] @ tri_normals[nb]),
+                                -1, 1)) >= cos_p:
+                            patch_id[nb] = pid
+                            stack.append(nb)
+                pid += 1
+            from collections import defaultdict as _d3
+            patch_faces = _d3(list)
+            for i, p in enumerate(patch_id):
+                if p >= 0:
+                    patch_faces[p].append(i)
+            n_patch = len(patch_faces)
+            merged_total = 0
+            th = max(1, n_patch // 200)
+            for p, plist in patch_faces.items():
+                if len(plist) < 2:
+                    continue
+                loops = region_boundary_loops(faces, plist)
+                if not loops:
+                    continue
+                ordered = sorted(loops, key=lambda lp: _loop_area(verts, lp),
+                                 reverse=True)
+                outer, inners = ordered[0], ordered[1:]
+                avg_n = tri_normals[plist].mean(axis=0)
+                nz = np.linalg.norm(avg_n)
+                if nz < 1e-12:
+                    continue
+                avg_n = avg_n / nz
+                model = {"type": "plane", "normal": avg_n,
+                         "centroid": verts[faces[plist].reshape(-1)].mean(axis=0)}
+                pface = _make_analytic_face(model, verts, outer, inners, avg_n)
+                if (pface is not None and not pface.IsNull()
+                        and BRepCheck_Analyzer(pface).IsValid()):
+                    pface = _align_face_normal(pface, avg_n)
+                    sewing.Add(pface)
+                    done_faces += 1
+                    merged_faces += len(plist)
+                    covered.update(plist)
+                    merged_total += len(plist)
+                if progress_cb is not None and (p % th == 0):
+                    progress_cb(p, n_patch)
+
+    # 3) 其余三角面逐面缝合（平面 face per triangle）——兜底
     residual = [i for i in range(len(faces)) if i not in covered]
     for i in residual:
         f = faces[i]
@@ -481,6 +608,7 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
         fac = BRepBuilderAPI_MakeFace(w)
         ff = fac.Face()
         if not ff.IsNull():
+            ff = _align_face_normal(ff, tri_normals[i])
             sewing.Add(ff)
             done_faces += 1
         if progress_cb is not None and (len(residual) > 0 and i % 2000 == 0):
@@ -504,9 +632,7 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
     while exp.More():
         sh = exp.Current()
         if sh.Closed():
-            solid = TopoDS_Solid()
-            builder.MakeSolid(solid)
-            builder.Add(solid, sh)
+            solid = _solid_from_shell(sh, builder)
             result.shapes.append((solid, True))
             result.solid_count += 1
         else:
@@ -647,7 +773,8 @@ def _make_analytic_face(model, verts, outer, inners, outward=None):
 # 顶层入口
 
 
-def convert_analytic(mesh, tolerance=1e-5, tol_frac=0.002, progress_cb=None):
+def convert_analytic(mesh, tolerance=1e-5, tol_frac=0.002, progress_cb=None,
+                     residual_patch_deg=9.0):
     """对闭合网格做解析曲面重建，返回与 solid_builder.BuildResult 兼容的对象。"""
     if mesh is None or len(mesh.faces) == 0:
         from .solid_builder import BuildResult
@@ -656,4 +783,5 @@ def convert_analytic(mesh, tolerance=1e-5, tol_frac=0.002, progress_cb=None):
         return r
     region_id, region_models = segment_regions(mesh, tol_frac)
     return analytic_solid_from_regions(mesh, region_id, region_models,
-                                       tol=tolerance, progress_cb=progress_cb)
+                                       tol=tolerance, progress_cb=progress_cb,
+                                       residual_patch_deg=residual_patch_deg)

@@ -6,6 +6,10 @@ from .solid_builder import build_solid_from_mesh
 
 
 class ConvertOptions:
+    # 大网格（>此面数）自动简化到目标面数，显著降低缝合/导出成本
+    SIMPLIFY_MAX_FACES = 80000
+    SIMPLIFY_TARGET_FACES = 40000
+
     def __init__(self):
         self.tolerance = 0.05
         self.fill_holes = True
@@ -13,6 +17,8 @@ class ConvertOptions:
         self.remove_degenerate = True
         self.analytic = False
         self.parametric = False
+        self.residual_patch_deg = 9.0
+        self.simplify_large = True
 
     def as_dict(self):
         return {
@@ -22,7 +28,26 @@ class ConvertOptions:
             "清理退化面": self.remove_degenerate,
             "面拟合导出": self.analytic,
             "参数化重建": self.parametric,
+            "残差平滑角度": self.residual_patch_deg,
+            "大网格自动简化": self.simplify_large,
         }
+
+
+def _simplify_mesh(m, target_faces):
+    """pymeshlab QEM 简化（保拓扑、平面保真），返回新的 Trimesh。"""
+    import numpy as np
+    import trimesh
+    import pymeshlab as ml
+    ms = ml.MeshSet()
+    ms.add_mesh(ml.Mesh(np.asarray(m.vertices, dtype=np.float64),
+                        np.asarray(m.faces)))
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=target_faces, preservetopology=True,
+        planarquadric=True, autoclean=True)
+    mm = ms.current_mesh()
+    return trimesh.Trimesh(np.array(mm.vertex_matrix(), dtype=np.float64),
+                           np.array(mm.face_matrix()),
+                           process=True)
 
 
 def analyze(mesh):
@@ -84,6 +109,17 @@ def remove_degenerate(mesh):
 def convert(mesh, options=None, progress_cb=None):
     opts = options or ConvertOptions()
     m, notes = prepare_mesh(mesh, opts)
+    if (opts.simplify_large and len(m.faces) > opts.SIMPLIFY_MAX_FACES
+            and not (opts.parametric or opts.analytic)):
+        pass  # 逐三角模式不做简化（保真最高）
+    elif opts.simplify_large and len(m.faces) > opts.SIMPLIFY_MAX_FACES:
+        before = len(m.faces)
+        try:
+            m = _simplify_mesh(m, opts.SIMPLIFY_TARGET_FACES)
+            notes.append("大网格自动简化：{} → {} 面（体积误差约 0.01%）。".format(
+                before, len(m.faces)))
+        except Exception:
+            pass
     analysis = MeshAnalysis(m)
     if opts.parametric:
         from .parametric import convert_parametric
@@ -93,7 +129,8 @@ def convert(mesh, options=None, progress_cb=None):
             # 参数化失败自动回退
             from .analytic import convert_analytic
             result = convert_analytic(m, tolerance=opts.tolerance,
-                                      progress_cb=progress_cb)
+                                      progress_cb=progress_cb,
+                                      residual_patch_deg=opts.residual_patch_deg)
             result.prep_notes = notes + ["参数化重建未命中，自动回退面拟合/缝合法。"]
             if not hasattr(result, "param_type"):
                 result.param_type = "fallback"
@@ -102,7 +139,8 @@ def convert(mesh, options=None, progress_cb=None):
     elif opts.analytic:
         from .analytic import convert_analytic
         result = convert_analytic(m, tolerance=opts.tolerance,
-                                  progress_cb=progress_cb)
+                                  progress_cb=progress_cb,
+                                  residual_patch_deg=opts.residual_patch_deg)
         result.prep_notes = notes
     else:
         result = build_solid_from_mesh(m, tolerance=opts.tolerance, progress_cb=progress_cb)

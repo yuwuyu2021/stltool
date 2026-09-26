@@ -80,8 +80,10 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
             r = min(max(float(cur) / float(total), 0.0), 1.0)
             if idx == 0:
                 lo, hi, label = 46, 68, "解析面区域拟合"
+            elif idx == 1:
+                lo, hi, label = 68, 86, "残差面 patch 合并"
             else:
-                lo, hi, label = 66, 92, "残差三角面逐面缝合"
+                lo, hi, label = 84, 92, "残差三角面逐面缝合"
             rep(int(lo + (hi - lo) * r),
                 "{:s} {:d}/{:d}".format(label, int(cur), total))
         except Exception:
