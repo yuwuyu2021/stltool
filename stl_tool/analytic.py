@@ -490,6 +490,8 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
         result.message = "解析曲面重建未产生任何面。"
         return result
 
+    if progress_cb is not None:
+        progress_cb(0, 3)  # 阶段哨兵 3：进入 OCC 整体缝合
     sewing.Perform()
     shape = sewing.SewedShape()
     if shape.IsNull():
@@ -498,6 +500,7 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
 
     builder = BRep_Builder()
     exp = TopExp_Explorer(shape, TopAbs_SHELL)
+    idx = 0
     while exp.More():
         sh = exp.Current()
         if sh.Closed():
@@ -509,11 +512,16 @@ def analytic_solid_from_regions(mesh, region_id, region_models, tol=1e-5,
         else:
             result.shapes.append((sh, False))
             result.shell_count += 1
+        idx += 1
+        if progress_cb is not None:
+            progress_cb(idx, 4)  # 阶段哨兵 4：提取壳体/实体
         exp.Next()
 
-    for s, _ in result.shapes:
+    for k, (s, _) in enumerate(result.shapes):
         if not BRepCheck_Analyzer(s).IsValid():
             result.invalid_count += 1
+        if progress_cb is not None:
+            progress_cb(k + 1, 5)  # 阶段哨兵 5：形状校验
 
     result.analytic_faces = merged_faces
     result.message = "解析曲面重建完成：{} 个实体；合并平面 {} 面，其余 {} 面逐三角。".format(

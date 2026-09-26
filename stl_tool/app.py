@@ -1,11 +1,12 @@
 import multiprocessing as mp
 import os
 import queue
+import re
 import time
 
 import numpy as np
 import trimesh
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QAction
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -18,6 +19,10 @@ from .widget3d import GLCADViewWidget
 
 GITHUB_REPO = "https://github.com/yuwuyu2021/stltool"
 GITHUB_RELEASES = GITHUB_REPO + "/releases"
+
+# 阶段主题（用于日志中识别"当前阶段"做计时与无进展提示）
+PHASE_KEYS = ("检测基本体素", "检测回转体", "解析面区域拟合", "残差三角面逐面缝合",
+              "缝合全部面", "提取壳体", "形状校验", "导出 STEP", "生成预览", "转换完成")
 
 
 def _step_out_path(src_file, src_dir, out_dir):
@@ -46,12 +51,39 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
             except Exception:
                 pass
 
+    big_total_seen = []
+
     def progress_cb(cur, total):
-        # 统一映射参数化检测/区域拟合/三角缝合的 (当前, 总量) 为 0-100 百分比
+        # 阶段状态机：参数化检测(total<=2) / 区域拟合与残差缝合(大循环单调递进) /
+        # 哨兵(3=缝合, 4=提取壳体, 5=校验)，保证百分比只进不退。
         try:
-            if total and total > 0 and cur is not None and cur >= 0:
-                r = min(max(float(cur) / float(total), 0.0), 1.0)
-                rep(6 + 86 * r, "特征重建 {:d}/{:d}".format(int(cur), int(total)))
+            total = int(total)
+            if cur is None or cur < 0 or total <= 0:
+                return
+            if total == 3:
+                rep(93, "缝合全部面（OCC sewing）…")
+                return
+            if total == 4:
+                rep(94, "提取壳体/实体 {:d} …".format(int(cur)))
+                return
+            if total == 5:
+                rep(97, "形状校验 {:d} …".format(int(cur)))
+                return
+            if total <= 2:
+                lo = 6 + 12 * (total - 1)
+                label = {1: "检测基本体素", 2: "检测回转体"}.get(total, "参数化检测")
+                rep(int(lo), label + " …")
+                return
+            if total not in big_total_seen:
+                big_total_seen.append(total)
+            idx = big_total_seen.index(total)
+            r = min(max(float(cur) / float(total), 0.0), 1.0)
+            if idx == 0:
+                lo, hi, label = 46, 68, "解析面区域拟合"
+            else:
+                lo, hi, label = 66, 92, "残差三角面逐面缝合"
+            rep(int(lo + (hi - lo) * r),
+                "{:s} {:d}/{:d}".format(label, int(cur), total))
         except Exception:
             pass
 
@@ -84,7 +116,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
         if shape is None:
             raise RuntimeError("没有可导出的实体形状。")
         out = _step_out_path(src_file, src_dir, out_dir)
-        rep(93, "导出 STEP 实体 …")
+        rep(98, "导出 STEP 实体 …")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         ok_w, msg = write_step(shape, out, schema=schema, write_pcurves=write_pcurves)
         if not ok_w:
@@ -102,7 +134,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
     pr = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, pr)
     vol_step = pr.Mass()
-    rep(96, "生成预览网格 …")
+    rep(99, "生成预览网格 …")
     step_mesh = None
     try:
         sm = shape_to_mesh(shape, linear_deflection=0.8, angular_deflection=0.5)
@@ -110,7 +142,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
             step_mesh = sm
     except Exception:
         pass
-    rep(99, "转换完成")
+    rep(100, "转换完成")
     return {
         "ok": True,
         "out_path": out,
@@ -227,6 +259,19 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self.setAcceptDrops(True)
         self._set_busy(False)
+        # 阶段计时 / 无进展兜底提示
+        self._busy_started = 0.0
+        self._phase_pct = 0
+        self._phase_key = None
+        self._phase_text = ""
+        self._phase_at = 0.0
+        self._last_log_at = 0.0
+        self._stale_hint_key = None
+        self._stale_hinted_at = 0.0
+        self._ticker = QTimer(self)
+        self._ticker.setInterval(1000)
+        self._ticker.timeout.connect(self._tick_stage)
+        self._ticker.start()
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -309,6 +354,9 @@ class MainWindow(QMainWindow):
         sb.addWidget(repo)
         ver = QLabel("v{}".format(VERSION))
         sb.addPermanentWidget(ver)
+        self._st_label = QLabel("")
+        self._st_label.setStyleSheet("color:#555;")
+        sb.addPermanentWidget(self._st_label)
         self.setStatusBar(sb)
 
     def _build_menu(self):
@@ -439,6 +487,15 @@ class MainWindow(QMainWindow):
         self.log("=" * 62)
         self.log("开始批量转换：共 {} 个文件 → {}".format(len(files), out))
         self._set_busy(True)
+        now = time.monotonic()
+        self._busy_started = now
+        self._phase_pct = 0
+        self._phase_key = None
+        self._phase_text = ""
+        self._phase_at = now
+        self._last_log_at = now
+        self._stale_hint_key = None
+        self._stale_hinted_at = 0.0
         self.progress.setVisible(True)
         self.progress.setRange(0, len(files) * 100)
         self.progress.setValue(0)
@@ -454,6 +511,22 @@ class MainWindow(QMainWindow):
 
     def _on_worker_log(self, msg):
         self.log(msg)
+        now = time.monotonic()
+        self._last_log_at = now
+        m = re.search(r"\[\s*\d+%\]\s*(.*)", msg)
+        if not m:
+            return
+        text = m.group(1).strip()
+        pct = int(re.search(r"\[\s*(\d+)%\]", msg).group(1))
+        key = next((k for k in PHASE_KEYS if k in text), text)
+        if key != self._phase_key:
+            if self._phase_key and self._phase_at:
+                self.log("  ↑ {} 完成 · 耗时 {:.1f}s".format(
+                    self._phase_key, now - self._phase_at))
+            self._phase_key = key
+            self._phase_at = now
+        self._phase_pct = pct
+        self._phase_text = text
 
     def _on_preview(self, mesh):
         try:
@@ -474,9 +547,46 @@ class MainWindow(QMainWindow):
         pct = int(round(cur / total * 100))
         self.progress.setFormat("文件 {}/{} · {}%".format(fi, n_files, pct))
 
+    def _fmt_sec(self, s):
+        s = int(s)
+        return "{:d}:{:02d}".format(s // 60, s % 60)
+
+    def _tick_stage(self):
+        """每秒刷新状态栏阶段计时；长时间无新日志时追加一次性兜底提示。"""
+        if not self.busy:
+            self._st_label.setText("")
+            return
+        now = time.monotonic()
+        tot = now - self._busy_started
+        phase_t = now - self._phase_at if self._phase_at else 0.0
+        since = now - self._last_log_at if self._last_log_at else 0.0
+        live = self.worker is not None and self.worker.isRunning()
+        if self._phase_key:
+            base = "累计 {}".format(self._fmt_sec(tot))
+            if self._phase_at:
+                base += " · {}% {}（{}）".format(
+                    self._phase_pct, self._phase_key, self._fmt_sec(phase_t))
+            if since > 10:
+                base += " · 已 {}s 无新日志".format(int(since))
+            self._st_label.setText(base)
+        else:
+            self._st_label.setText("累计 {} · 预热中（启动子进程…）".format(self._fmt_sec(tot)))
+        if live and since > 25 and (self._phase_pct, self._phase_key) != self._stale_hint_key:
+            self._stale_hint_key = (self._phase_pct, self._phase_key)
+            self._stale_hinted_at = now
+            self.log("⏳ “{}” 已进行 {}（连续 {}s 无新日志）。该阶段为后台整体计算（无内部进度），进程运行中，请耐心等待。".format(
+                self._phase_text or self._phase_key, self._fmt_sec(phase_t), int(since)))
+
     def _on_finished(self, d):
         self.progress.setVisible(False)
         self._set_busy(False)
+        self._busy_started = 0.0
+        self._phase_key = None
+        self._phase_text = ""
+        self._phase_at = 0.0
+        self._last_log_at = 0.0
+        self._stale_hint_key = None
+        self._st_label.setText("")
         self.log("-" * 62)
         self.log("==== 转换完成汇总 ====")
         self.log("总文件 {} · 成功 {} · 失败 {}".format(d["total"], d["ok"], d["failed"]))

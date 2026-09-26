@@ -6,7 +6,7 @@
 
 > 把 3D 打印 / 建模用的 **STL 网格**，一键变成 CAD 软件（SolidWorks、Fusion 360、FreeCAD 等）**能打开、能直接改尺寸**的 **STEP 实体**。
 
-[![版本](https://img.shields.io/badge/最新版-v0.7.1-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
+[![版本](https://img.shields.io/badge/最新版-v0.7.2-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
 [![平台](https://img.shields.io/badge/平台-Windows-0078d6?style=flat-square)]()
 [![分发](https://img.shields.io/badge/单文件-免安装-orange?style=flat-square)]()
 [![许可](https://img.shields.io/badge/许可-AGPL--3.0-red?style=flat-square)](LICENSE)
@@ -52,7 +52,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 ## 🚀 快速开始（推荐）
 
 1. 打开 **[GitHub Releases 发布页](https://github.com/yuwuyu2021/stltool/releases/latest)**
-2. 在最新版本的 **Assets** 中下载 `STLTool-v0.7.1-win64-singlefile.exe`
+2. 在最新版本的 **Assets** 中下载 `STLTool-v0.7.2-win64-singlefile.exe`
 3. 双击运行（首次启动需解压，等待几秒属正常现象）
 
 > 💡 若系统提示"未知来源"，点击 **更多信息 → 仍要运行** 即可。单文件版无需联网、无需安装。
