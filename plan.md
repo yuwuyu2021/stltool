@@ -25,8 +25,8 @@
   - ✅ 已完成：PyQt6 + pyqtgraph OpenGL 预览、边界/法向高亮、后台线程转换、进度条、日志、导出对话框
 - [ ] M3 自动修复与鲁棒性：孔洞修补、缝合容差调节、多体/多壳处理、失败诊断建议、大网格精简
   - ⏳ 部分完成：孔洞修补、法向修复、退化面清理、缝合容差、多壳导出宏、大网格自动简化（见 M10）。待办：更精细的失败诊断
-- [ ] M4 打磨发布：单元测试、性能优化、打包脚本（PyInstaller）、README、文档
-  - ⏳ 部分完成：核心单元测试、README；首次完整打包脚本(STLTool.spec, 单文件 351MB)
+- [x] M4 打磨发布：单元测试、性能优化、打包脚本（PyInstaller）、README、文档
+  - ✅ 完成：核心单元测试（22 全绿）、README、打包脚本（STLTool.spec 单文件 326.8MB）与 **v0.11.0 发布**（GitHub Releases tag v0.11.0，2026-09-28；gh release create + 326.8MB asset 经直连上传；此前 v0.8.0~v0.11.0 累积功能一并随此版发布）
   - ✅ v0.0.5 修复极小退化面导致实体无效的缺陷：真实扳机 STL（含面积 ~1e-6 退化面）经"清理退化面+自动补孔"产出合法闭合实体（BRepCheck valid），新增回归测试 tests/fixtures/block26_trigger.stl
   - ⏳ 自举安装式最小 exe（bootstrap）：内嵌嵌入式 Python(python-embed)，首次运行在 exe 所在目录自动创建 runtime/.venv、下载 get-pip 并 pip 安装依赖、复制应用源码，之后直接启动，秒开。待办：引导器多国内 pip 源+自动切换、日志文件、失败弹窗、（暂停中）
 - [x] M5 STL 网格编辑与面片合并（v0.0.6，已完成）
@@ -100,6 +100,7 @@
 - v0.7.2：**转换进度可视化完善**——真实 Benchy 实测（1907 解析区 + 22.4 万残差面）暴露两缺陷：① 参数化命中瞬间跳 92% 后回退 6%（进度条倒退）；② 残差缝合后进入 OCC `sewing.Perform()`/壳体提取/校验无任何回显，长时间停在 91%。修复：`app.py` 进度状态机按阶段分区映射（参数化检测 6~30%、解析面区域拟合 46~68%、残差三角面逐面缝合 66~92%，只进不退）；`analytic.py` 尾程插桩三处哨兵（93% 缝合全部面 / 94% 提取壳体实体 / 97% BRepCheck 校验），消除卡顿假象。
 - v0.8.0：**大网格性能轮（M10）**——pipeline 新增 `ConvertOptions.simplify_large`（默认开，>8 万面自动 pymeshlab QEM 简化至 4 万，缺依赖优雅跳过并记 notes）；`analytic.py` 新增 `_align_face_normal`（平面 face 法向对齐网格向外）并套用于解析区/低角度 patch/逐三角三类面，新增低角度残差 patch 合并（`residual_patch_deg`，有效合并率实测仅 ~8.5%、失真，默认 9.0 且大面积退回逐三角，小模型共面区受益）。端到端：Benchy 15min+/570MB → **≈120s / 99.1MB**；14 测试全绿。
 - v0.9.0：**板件边缘圆弧倒边/倒角识别（M11，未发布）**——`parametric.py` 新增 `_round_plate`（体积反演 fillet/chamfer 半径扫描，fillet 优先）+ `detect_plate` 集成（斜面占比>3% 或体积误差>25% 触发；仅显著优于整平基本面才采纳，避免误套小 R）+ `info["edge_round"]` 输出"带孔薄板 + 边缘圆弧倒边/倒角 R…"。修复 round 分支引用未定义 `basis/origin/height_vec`（顺序重排）+ 步进 0.15/上界 厚度*0.5 覆盖 R=2.0 临界点。合成闭环：R2 圆角→fillet r=1.95 (0.12%)、2mm 倒角→chamfer r=1.95 (0.29%)、矩形板不误报；真实件全量回归无破坏（扣盖类偏差实为空腔壳体，正确拒绝）。新增 3 测试（`test_round_plate_fillet_closedloop`/`_chamfer_closedloop`/`_plain_no_false_positive`），17 测试全绿。
-- v0.10.0：**空腔/镂空件诚实拒绝（M12，未发布）**——`parametric.py` 新增 `_solid_gap_ratio`（厚度轴水平主面组面积×全跨距/实际体积，主面分组聚合 + 轴正规化）+ `detect_plate` 成功路径无条件拦网（比值>1.35 拒绝并给 `reject_reason`，`convert_parametric` 定制消息）。真实样本全量回归：Klicky开关座扣盖假阳性（原 plate -15.2%）→ MISS+空腔提示；全部真实 plate 无一误伤（三轴 max 曾误伤定位板安装架，回单轴解除；轴噪声曾致扣盖 ratio 2.0→0.93 漏拒，正规化修复）。新增 2 测试（`test_plate_cavity_reject`/`_plate_solid_not_rejected`），19 测试全绿。
-- v0.10.1：**revolve 空腔行为锁定（未发布）**——侦察确认 `detect_revolve` 对空腔盒由既有 0.30 体积护栏自然拦截（convert→fallback），新增回归测试 `test_revolve_hollow_not_false_positive` 锁定；护栏收紧 0.15 因合成酒杯固有拟合误差 28.45% ≥ 真实件 27.2% 不可行已回滚。Klicky支架扣盖归因凹槽剥壳（M8 语义）非空腔。20 测试全绿。
-- v0.11.0：**凸台/沉台识别（M8 遗留，未发布）**——`parametric.py` 新增 `_detect_bosses`：沿厚度轴找高于主顶面/低于主底面的显著水平面组，面片投影 unary_union 挤出台体并与板主体 Fuse，按「BRepCheck valid 且体积误差绝对值继续缩小」贪心采纳（无益/异常回退原 solid，绝不过拟合）。真实回归：Monster8 板安装架 -2.21%→**-0.18%**（bosses=5，四脚台归位）、Klicky支架扣盖 -13.6%→-10.35%（bosses=2）、刷头安装架 -13.9%→-11.6%；普通板（盖板L/sherpa）零误伤。新增测试 `test_plate_boss_recovered`（合成凸台板 err≤3%）/`test_plate_boss_no_false_positive`（普通板 bosses=0），22 测试全绿。
+- v0.10.0：**空腔/镂空件诚实拒绝（M12，已随 v0.11.0 发布）**——`parametric.py` 新增 `_solid_gap_ratio`（厚度轴水平主面组面积×全跨距/实际体积，主面分组聚合 + 轴正规化）+ `detect_plate` 成功路径无条件拦网（比值>1.35 拒绝并给 `reject_reason`，`convert_parametric` 定制消息）。真实样本全量回归：Klicky开关座扣盖假阳性（原 plate -15.2%）→ MISS+空腔提示；全部真实 plate 无一误伤（三轴 max 曾误伤定位板安装架，回单轴解除；轴噪声曾致扣盖 ratio 2.0→0.93 漏拒，正规化修复）。新增 2 测试（`test_plate_cavity_reject`/`_plate_solid_not_rejected`），19 测试全绿。
+- v0.10.1：**revolve 空腔行为锁定（已随 v0.11.0 发布）**——侦察确认 `detect_revolve` 对空腔盒由既有 0.30 体积护栏自然拦截（convert→fallback），新增回归测试 `test_revolve_hollow_not_false_positive` 锁定；护栏收紧 0.15 因合成酒杯固有拟合误差 28.45% ≥ 真实件 27.2% 不可行已回滚。Klicky支架扣盖归因凹槽剥壳（M8 语义）非空腔。20 测试全绿。
+- v0.11.0：**凸台/沉台识别（M8 遗留，已发布）**——`parametric.py` 新增 `_detect_bosses`：沿厚度轴找高于主顶面/低于主底面的显著水平面组，面片投影 unary_union 挤出台体并与板主体 Fuse，按「BRepCheck valid 且体积误差绝对值继续缩小」贪心采纳（无益/异常回退原 solid，绝不过拟合）。真实回归：Monster8 板安装架 -2.21%→**-0.18%**（bosses=5，四脚台归位）、Klicky支架扣盖 -13.6%→-10.35%（bosses=2）、刷头安装架 -13.9%→-11.6%；普通板（盖板L/sherpa）零误伤。新增测试 `test_plate_boss_recovered`（合成凸台板 err≤3%）/`test_plate_boss_no_false_positive`（普通板 bosses=0），22 测试全绿。
+- v0.11.0 发布记录：GitHub Releases tag v0.11.0（[releases/tag/v0.11.0](https://github.com/yuwuyu2021/stltool/releases/tag/v0.11.0)），单文件 `STLTool-v0.11.0-win64-singlefile.exe`（326.8MB，sha256 `550dfb9c…b4ba0706`）；v0.8.0~v0.11.0 累积功能随此版发布。
