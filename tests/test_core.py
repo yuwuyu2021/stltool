@@ -521,6 +521,25 @@ def test_plate_solid_not_rejected():
     assert ratio is not None and ratio < 1.2, "实心板 gap ratio 应 <1.2，实际 {}".format(ratio)
 
 
+def test_revolve_hollow_not_false_positive():
+    """空心回转体（空腔盒）不得被 revolve 拟合为外壳回转假阳性。"""
+    from OCP.gp import gp_Pnt
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh, ConvertOptions, convert
+
+    o = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 26, 18, 6).Shape()
+    i = BRepPrimAPI_MakeBox(gp_Pnt(2, 2, 0.5), 22, 14, 5).Shape()
+    c = BRepAlgoAPI_Cut(o, i).Shape()
+    mesh, _ = prepare_mesh(shape_to_mesh(c, 0.4, 0.4))
+    opts = ConvertOptions()
+    opts.parametric = True
+    opts.tolerance = 1e-4
+    r = convert(mesh, opts)
+    assert getattr(r, "param_type", None) != "revolve", (
+        "空腔盒不应被拟合为回转体，实际 {}".format(getattr(r, "param_type", None)))
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")

@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.10.0
+当前版本：v0.10.1
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -69,7 +69,7 @@
   - 方案（用户选定 B 诚实验真回退，非 A 壳体重建/非 C 先找等壁厚样本）：`detect_plate` round 通道未修复时，用 `_solid_gap_ratio`（新增）沿**厚度轴**评估「最大水平主面组面积 × 水平面全跨距（面积加权 p5/p95）」/ 实际体积，比值 >1.35 即存在第二个显著水平主面（内腔底面/双层壁）——压低厚度凑体积是过拟合，诚实拒绝并返回 `info["reject_reason"]`（`convert_parametric` 输出定制消息，提示走逐三角/analytic）。拦网部署于**成功路径上无条件执行**（Klicky扣盖 err0=-11% 不触发 round/_wmed 也要阻断）。
   - 实现要点：① 水平面按 z 主平面**分组聚合面积**（`tol=0.02×跨距` 分桶 `np.add.at`），避免把离散三角当主面（shape_to_mesh/extrude 一个平面切成多个三角，`w.max()` 单三角面积只取其半致比值对半）；② 轴**正规化到最近主轴**（`_find_thickness_axis` 返回浮点含 0.024 z 噪声会把主面投影斜切散桶，比值 2.0→0.93）；③ **仅沿厚度轴评估**——三轴取 max 会把竖直端面×长跨距（加强肋/安装沿/MGN 型材定位块）误判为空腔，真实"定位板安装架"（177 点 12 孔，原 plate -3.9%）曾被误伤，恢复单轴后解除。
   - ✅ 真实样本全量回归：Klicky开关座扣盖（原假阳性 plate -15.2%）→ MISS + "检测到内部空腔/镂空"；全部真实 plate（Monster8/Y限位块/盖板L/sherpa扣盖/刷头安装架/Klicky支架扣盖/定位板安装架）无一误伤；origin MISS 保持 MISS（MGN 型材定位块等不再被三轴误拒）。新增 2 测试（`test_plate_cavity_reject` 合成空腔盒 ratio≈2.2>1.35、`test_plate_solid_not_rejected` 实心双孔板 ratio≈1.06<1.2），19 测试全绿。
-  - ⛔ 遗留：① `detect_revolve` 对扁平空腔盒（26×18×6 壳）仍会假阳性命中（母线 5 段拟合外壳）；② Klicky支架扣盖（-13.6%）仍保持 plate（ratio 0.84 未触阈值）——真实壳体识别（等壁厚）留待后续。
+  - ⛔ 遗留：① 空腔盒在 `detect_revolve` 的假阳性（合成 26×18×6 壳曾拟合"母线 5 段"）经查由既有 0.30 体积护栏**自然拦截**（convert→fallback），已添加锁定测试 `test_revolve_hollow_not_false_positive`；护栏收紧 0.15 不可行——合成酒杯固有拟合误差 28.45% ≥ 真实件（Mini 12864 屏安装座 +27.2%、热床限位块 -21.7%），阈值无法区分且误伤回转类，已回滚。真实大偏差 revolve 命中仍属假阳性，待专门识别（如每层内半径环检测空心）；② Klicky支架扣盖（-13.6%）归因为顶/底**凹槽区剥壳**（主面组 319/348 vs 外环 504）而非双主面空腔，属 M8 沉槽/浮雕未识别范畴、非 M12 语义，ratio 0.84 不触发拦截正确；真实壳体（等壁厚）重建留待后续。
 
 ## 量化指标
 - 转换成功率：闭合网格 100%，轻度开放网格 ≥90%（当前测试：闭合 100%）
@@ -101,3 +101,4 @@
 - v0.8.0：**大网格性能轮（M10）**——pipeline 新增 `ConvertOptions.simplify_large`（默认开，>8 万面自动 pymeshlab QEM 简化至 4 万，缺依赖优雅跳过并记 notes）；`analytic.py` 新增 `_align_face_normal`（平面 face 法向对齐网格向外）并套用于解析区/低角度 patch/逐三角三类面，新增低角度残差 patch 合并（`residual_patch_deg`，有效合并率实测仅 ~8.5%、失真，默认 9.0 且大面积退回逐三角，小模型共面区受益）。端到端：Benchy 15min+/570MB → **≈120s / 99.1MB**；14 测试全绿。
 - v0.9.0：**板件边缘圆弧倒边/倒角识别（M11，未发布）**——`parametric.py` 新增 `_round_plate`（体积反演 fillet/chamfer 半径扫描，fillet 优先）+ `detect_plate` 集成（斜面占比>3% 或体积误差>25% 触发；仅显著优于整平基本面才采纳，避免误套小 R）+ `info["edge_round"]` 输出"带孔薄板 + 边缘圆弧倒边/倒角 R…"。修复 round 分支引用未定义 `basis/origin/height_vec`（顺序重排）+ 步进 0.15/上界 厚度*0.5 覆盖 R=2.0 临界点。合成闭环：R2 圆角→fillet r=1.95 (0.12%)、2mm 倒角→chamfer r=1.95 (0.29%)、矩形板不误报；真实件全量回归无破坏（扣盖类偏差实为空腔壳体，正确拒绝）。新增 3 测试（`test_round_plate_fillet_closedloop`/`_chamfer_closedloop`/`_plain_no_false_positive`），17 测试全绿。
 - v0.10.0：**空腔/镂空件诚实拒绝（M12，未发布）**——`parametric.py` 新增 `_solid_gap_ratio`（厚度轴水平主面组面积×全跨距/实际体积，主面分组聚合 + 轴正规化）+ `detect_plate` 成功路径无条件拦网（比值>1.35 拒绝并给 `reject_reason`，`convert_parametric` 定制消息）。真实样本全量回归：Klicky开关座扣盖假阳性（原 plate -15.2%）→ MISS+空腔提示；全部真实 plate 无一误伤（三轴 max 曾误伤定位板安装架，回单轴解除；轴噪声曾致扣盖 ratio 2.0→0.93 漏拒，正规化修复）。新增 2 测试（`test_plate_cavity_reject`/`_plate_solid_not_rejected`），19 测试全绿。
+- v0.10.1：**revolve 空腔行为锁定（未发布）**——侦察确认 `detect_revolve` 对空腔盒由既有 0.30 体积护栏自然拦截（convert→fallback），新增回归测试 `test_revolve_hollow_not_false_positive` 锁定；护栏收紧 0.15 因合成酒杯固有拟合误差 28.45% ≥ 真实件 27.2% 不可行已回滚。Klicky支架扣盖归因凹槽剥壳（M8 语义）非空腔。20 测试全绿。

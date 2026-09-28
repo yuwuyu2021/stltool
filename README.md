@@ -8,7 +8,7 @@
 
 > 🧪 **这是一个仍在探索阶段的个人学习项目**——作者利用业余时间一点一点啃"网格 → 可编辑参数化实体"这块难骨头，代码还可能粗糙、结果可能出错。**你的每条意见、建议、甚至一句批评，都是这个项目最宝贵的养分。** 发现 bug 或想到更好的思路，欢迎直接 [提 Issue](https://github.com/yuwuyu2021/stltool/issues) 交流，期待你的声音。
 
-[![版本](https://img.shields.io/badge/最新版-v0.10.0-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
+[![版本](https://img.shields.io/badge/最新版-v0.10.1-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
 [![平台](https://img.shields.io/badge/平台-Windows-0078d6?style=flat-square)]()
 [![分发](https://img.shields.io/badge/单文件-免安装-orange?style=flat-square)]()
 [![许可](https://img.shields.io/badge/许可-AGPL--3.0-red?style=flat-square)](LICENSE)
@@ -73,7 +73,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 ## 🚀 快速开始（推荐）
 
 1. 打开 **[GitHub Releases 发布页](https://github.com/yuwuyu2021/stltool/releases/latest)**
-2. 在最新版本的 **Assets** 中下载 `STLTool-v0.10.0-win64-singlefile.exe`
+2. 在最新版本的 **Assets** 中下载 `STLTool-v0.10.1-win64-singlefile.exe`
 3. 双击运行（首次启动需解压，等待几秒属正常现象）
 
 > 💡 若系统提示"未知来源"，点击 **更多信息 → 仍要运行** 即可。单文件版无需联网、无需安装。
