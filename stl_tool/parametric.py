@@ -1079,6 +1079,15 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
                         err_r = abs(v_rt - vol) / vol
                         if err_r < err0 - 0.003 and err_r < 0.05:
                             round_ok = rt
+        # M12-B 空腔/镂空阻断：round 通道未修复时，若「外环面积 × 全部水平
+        # 主面全跨距」远超实际体积，说明存在第二个显著水平主面（如盒体内腔
+        # 底面/双层结构），此时压低厚度去凑体积是几何失真的过拟合（会把
+        # 5.16 厚的镂空盒套成 2.84 薄板），应诚实拒绝并回退。
+        if round_ok is None:
+            gap = _solid_gap_ratio(mesh, axis, vol)
+            if gap is not None and gap > 1.35:
+                return None, {"reject_reason":
+                    "检测到内部空腔/镂空（第二主面或双层壁），薄板参数化不适用"}
         if round_ok is None and err0 > 0.25:
                 # 原计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
                 # 多于主体板面）拉偏 → 面积加权中位把权重回归主体大平面
@@ -1356,6 +1365,58 @@ def _round_plate(solid, mesh, axis, plane_n, poly, z_surf, z_other,
         return None, None, None
 
 
+def _solid_gap_ratio(mesh, axis, vol):
+    """空腔/镂空判定：沿厚度轴求「最大水平主面面积 × 主面全跨距」/ 实际体积。
+
+    若结构存在第二个显著水平主面（盒体内腔底面/双层壁），跨距覆盖整个结构
+    高度，使该估计显著超过实际体积；普通单层薄板/带孔板其值与体积接近。
+    只沿厚度轴评估：竖直方向的端面/长跨距（加强肋、安装沿）不代表空腔，
+    取三轴最大会把真实件误拒。detect_plate 用它判断：比值 >1.35 即内部存在
+    空腔/镂空（或深凹陷），压低厚度凑体积是几何失真过拟合，应诚实拒绝。
+    无法计算时返回 None。
+    """
+    if vol is None or vol <= 0:
+        return None
+    try:
+        # 正规化到最近主轴：_find_thickness_axis 返回的浮点噪声会沿第三个分量
+        # 把主面投影斜切（如 0.024 的 z 分量使面组散到多个桶），导致面积低估
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = np.eye(3)[int(np.argmax(np.abs(axis)))]
+        nf = _face_normals(mesh.faces, mesh.vertices)
+        v = mesh.vertices
+        fz = mesh.faces
+        hz = np.abs(nf @ axis) > 0.9
+        if not hz.any():
+            return None
+        aff = mesh.area_faces[hz].copy()
+        zz = (v[fz[hz]].mean(axis=1)) @ axis
+        ptp = float(zz.max() - zz.min())
+        if ptp <= 1e-9:
+            return None
+        # 按主平面分组聚合面积：同 z（容差 2% 全跨距）的面属同一主面，
+        # 避免把离散三角当主面（shape_to_mesh/extrude 一个平面常切成多个三角）
+        tol = 0.02 * ptp
+        bucket = np.round(zz / tol).astype(np.int64)
+        gz = np.zeros(bucket.max() + 1, dtype=np.float64)
+        np.add.at(gz, bucket, aff)
+        gw = gz[gz > 0]
+        if gw.size == 0:
+            return None
+        ordi = np.argsort(zz)
+        cw = np.cumsum(aff[ordi])
+        if cw[-1] <= 0:
+            return None
+        cw /= cw[-1]
+        lo = float(np.interp(0.05, cw, zz[ordi]))
+        hi = float(np.interp(0.95, cw, zz[ordi]))
+        span = hi - lo
+        if span <= 1e-9:
+            return None
+        return float(gw.max() * span / vol)
+    except Exception:
+        return None
+
+
 def _volume_approx(mesh):
     try:
         return float(mesh.volume)
@@ -1423,7 +1484,11 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                     note = "识别为带孔薄板（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
                         info["outer_pts"], info["hole_count"], info["thickness"])
             else:
-                result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
+                if info is not None and info.get("reject_reason"):
+                    result.message = "{}，请走逐三角或 analytic 模式。".format(
+                        info["reject_reason"])
+                else:
+                    result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
                 return result
 
     for s, _ in result.shapes:

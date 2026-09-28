@@ -1,4 +1,4 @@
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 APP_NAME = "STL 转 STEP 工具"
 
 import os

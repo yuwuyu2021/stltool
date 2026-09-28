@@ -485,6 +485,42 @@ def test_round_plate_plain_no_false_positive():
     assert out[0] is None, "无圆角板不应识别出倒边"
 
 
+def test_plate_cavity_reject():
+    """空腔/镂空盒体：_solid_gap_ratio 显著 >1.35（存在第二水平主面）。"""
+    import shapely.geometry as sg
+    from OCP.gp import gp_Pnt
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh
+    from stl_tool.parametric import _find_thickness_axis, _solid_gap_ratio
+
+    # 26×18×6 外盒，内腔 22×14×5（顶底留壁）→ 水平面全跨距≈6，ratio≈2.0
+    o = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 26, 18, 6).Shape()
+    i = BRepPrimAPI_MakeBox(gp_Pnt(2, 2, 0.5), 22, 14, 5).Shape()
+    c = BRepAlgoAPI_Cut(o, i).Shape()
+    mesh, _ = prepare_mesh(shape_to_mesh(c, 0.4, 0.4))
+    axis = _find_thickness_axis(mesh)
+    ratio = _solid_gap_ratio(mesh, axis, mesh.volume)
+    assert ratio is not None and ratio > 1.35, "空腔盒 gap ratio 应 >1.35，实际 {}".format(ratio)
+
+
+def test_plate_solid_not_rejected():
+    """实心带孔板：gap ratio 接近 1.0，不得被空腔阻断误伤。"""
+    import shapely.geometry as sg
+    from stl_tool.pipeline import prepare_mesh
+    from stl_tool.parametric import _find_thickness_axis, _solid_gap_ratio
+
+    # 26×18×6 实心板，两个通孔
+    poly = sg.box(0, 0, 26, 18)
+    for (cx, cy) in ((8, 9), (18, 9)):
+        poly = poly.difference(sg.Point(cx, cy).buffer(2.0))
+    mesh = trimesh.creation.extrude_polygon(poly, 6)
+    mesh, _ = prepare_mesh(mesh)
+    axis = _find_thickness_axis(mesh)
+    ratio = _solid_gap_ratio(mesh, axis, mesh.volume)
+    assert ratio is not None and ratio < 1.2, "实心板 gap ratio 应 <1.2，实际 {}".format(ratio)
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
