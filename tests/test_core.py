@@ -381,11 +381,113 @@ def test_convert_parametric_obround():
             "体积误差 {:.1%}".format((sv - mesh.volume) / mesh.volume)
 
 
+def test_round_plate_fillet_closedloop():
+    """顶边 R2 圆角矩形板应复原为 fillet r≈2，而非误判倒角。"""
+    import shapely.geometry as sg
+    from OCP.gp import gp_Pnt
+    from OCP.TopoDS import TopoDS
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from stl_tool.pipeline import shape_to_mesh
+    from stl_tool.parametric import _volume, _round_plate
+
+    cx, cy, cz, r = 40.0, 30.0, 4.0, 2.0
+    b = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), cx, cy, cz).Shape()
+    mf = BRepFilletAPI_MakeFillet(b)
+    ie = TopExp_Explorer(b, TopAbs_EDGE)
+    while ie.More():
+        e = TopoDS.Edge_s(ie.Current())
+        zs = []
+        ve = TopExp_Explorer(e, TopAbs_VERTEX)
+        while ve.More():
+            zs.append(BRep_Tool.Pnt_s(TopoDS.Vertex_s(ve.Current())).Z())
+            ve.Next()
+        if all(abs(z - cz) < 1e-3 for z in zs):
+            mf.Add(float(r), e)
+        ie.Next()
+    sh = mf.Shape()
+    mesh = shape_to_mesh(sh, 0.3, 0.3)
+
+    axis = np.array([0.0, 0.0, -1.0])
+    poly = sg.Polygon([(0, 0), (cx, 0), (cx, cy), (0, cy)])
+    target = _volume(sh)
+    out = _round_plate(BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), cx, cy, cz).Shape(),
+                       mesh, axis, axis, poly, 0.0, cz, cz, vol_target=target,
+                       max_err=0.05)
+    assert out[0] is not None, "R2 圆角应被识别"
+    assert out[2] == "fillet", "应为 fillet，实际 {}".format(out[2])
+    assert abs(out[1] - r) < 0.3, "半径应接近 2.0，实际 {:.2f}".format(out[1])
+    err = abs(_volume(out[0]) - target) / target
+    assert err < 0.02, "体积误差 {:.1%}".format(err)
+
+
+def test_round_plate_chamfer_closedloop():
+    """顶边 2mm 倒角矩形板应复原为 chamfer r≈2。"""
+    import shapely.geometry as sg
+    from OCP.gp import gp_Pnt
+    from OCP.TopoDS import TopoDS
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+    from stl_tool.pipeline import shape_to_mesh
+    from stl_tool.parametric import _volume, _round_plate
+
+    cx, cy, cz, a = 40.0, 30.0, 4.0, 2.0
+    b = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), cx, cy, cz).Shape()
+    mc = BRepFilletAPI_MakeChamfer(b)
+    ie = TopExp_Explorer(b, TopAbs_EDGE)
+    while ie.More():
+        e = TopoDS.Edge_s(ie.Current())
+        zs = []
+        ve = TopExp_Explorer(e, TopAbs_VERTEX)
+        while ve.More():
+            zs.append(BRep_Tool.Pnt_s(TopoDS.Vertex_s(ve.Current())).Z())
+            ve.Next()
+        if all(abs(z - cz) < 1e-3 for z in zs):
+            mc.Add(float(a), e)
+        ie.Next()
+    sh = mc.Shape()
+    mesh = shape_to_mesh(sh, 0.3, 0.3)
+
+    axis = np.array([0.0, 0.0, -1.0])
+    poly = sg.Polygon([(0, 0), (cx, 0), (cx, cy), (0, cy)])
+    target = _volume(sh)
+    out = _round_plate(BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), cx, cy, cz).Shape(),
+                       mesh, axis, axis, poly, 0.0, cz, cz, vol_target=target,
+                       max_err=0.05)
+    assert out[0] is not None, "2mm 倒角应被识别"
+    assert out[2] == "chamfer", "应为 chamfer，实际 {}".format(out[2])
+    assert abs(out[1] - a) < 0.3, "倒角应接近 2.0，实际 {:.2f}".format(out[1])
+    err = abs(_volume(out[0]) - target) / target
+    assert err < 0.02, "体积误差 {:.1%}".format(err)
+
+
+def test_round_plate_plain_no_false_positive():
+    """纯矩形板（无圆角/倒角）不应被套上边缘倒边。"""
+    import shapely.geometry as sg
+    from OCP.gp import gp_Pnt
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from stl_tool.pipeline import shape_to_mesh
+    from stl_tool.parametric import _volume, _round_plate
+
+    cx, cy, cz = 40.0, 30.0, 4.0
+    b = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), cx, cy, cz).Shape()
+    mesh = shape_to_mesh(b, 0.3, 0.3)
+    axis = np.array([0.0, 0.0, -1.0])
+    poly = sg.Polygon([(0, 0), (cx, 0), (cx, cy), (0, cy)])
+    out = _round_plate(b, mesh, axis, axis, poly, 0.0, cz, cz,
+                       vol_target=_volume(b), max_err=0.05)
+    assert out[0] is None, "无圆角板不应识别出倒边"
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
-    test_sphere_convert()
-    print("sphere ok")
     test_open_plate_autofill()
     print("open plate autofill ok")
     test_open_plate_no_fill_reports_shell()

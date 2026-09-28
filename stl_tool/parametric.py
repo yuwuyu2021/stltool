@@ -1041,40 +1041,7 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
 
     none_w = None  # 加权回退标记：沉孔检测用原 top_z，挤出高度用推定的主体面
 
-    # 体积校验（相对）；失败时用面积加权中位重估主体面高再试一次
-    vol = _volume_approx(mesh)
-    if vol is not None and vol > 0:
-        est = poly.area * thickness
-        if abs(est - vol) / vol > 0.25:
-            # 计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
-            # 多于主体板面）拉偏 → 面积加权中位把权重回归主体大平面
-            def _wmed(d_vals, w_vals):
-                msk = np.isfinite(d_vals) & (w_vals > 0)
-                d = np.asarray(d_vals, dtype=np.float64)[msk]
-                w = np.asarray(w_vals, dtype=np.float64)[msk]
-                if d.size == 0 or w.sum() <= 0:
-                    return np.nan
-                i = np.argsort(d)
-                cw = np.cumsum(w[i])
-                k = int(np.searchsorted(cw, cw[-1] * 0.5))
-                k = min(k, d.size - 1)
-                return float(d[i][k])
-            cz = (v[mesh.faces].mean(axis=1)) @ axis
-            wa_other = _wmed(cz[other], mesh.area_faces[other])
-            wa_side = _wmed(cz[side], mesh.area_faces[side])
-            z_other2 = max(wa_other, wa_side)
-            z_surf2 = min(z_surf, z_other2 - thickness)
-            t2 = abs(z_other2 - z_surf2)
-            if t2 >= 1e-9:
-                est2 = poly.area * t2
-                if abs(est2 - vol) / vol > 0.25:
-                    return None, None
-                thickness = t2
-                z_other = z_other2
-                z_surf = z_surf2
-                none_w = 1
-
-    # 组装挤出
+    # 组装挤出参数（需在体积校验/圆角重建前就绪）
     u = np.cross(axis, np.array([1.0, 0.0, 0.0]))
     if np.linalg.norm(u) < 1e-9:
         u = np.cross(axis, np.array([0.0, 1.0, 0.0]))
@@ -1082,6 +1049,68 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     vv = np.cross(axis, u)
     basis = np.array([u, vv])
 
+    # 体积校验（相对）；失败或斜面占比偏高时先尝试「边缘圆弧/倒角重建」，
+    # 再试面积加权中位
+    vol = _volume_approx(mesh)
+    round_ok = None
+    if vol is not None and vol > 0:
+        est = poly.area * thickness
+        err0 = abs(est - vol) / vol
+        # 斜面占比（法向与板轴 15~75°）是倒角/圆角存在的最直接证据
+        nrm_f = _face_normals(mesh.faces, v)
+        slope_frac = float(
+            mesh.area_faces[np.abs(nrm_f @ axis) < 0.95].sum()
+            / mesh.area_faces.sum())
+        if err0 > 0.25 or slope_frac > 0.03:
+            # 可能是顶/底边缘带圆弧倒边或倒角：先建板主体，再 size 匹配
+            origin_try = axis * (z_surf if z_other > z_surf else z_surf - thickness)
+            hv_try = axis * (z_other - z_surf)
+            solid_try = _extrude_solid(poly, basis, origin_try, hv_try,
+                                       plane_normal=plane_n)
+            if solid_try is not None:
+                rt = _round_plate(solid_try, mesh, axis, plane_n, poly,
+                                  z_surf, z_other, thickness, vol_target=vol,
+                                  max_err=max(0.05, min(0.10, err0 * 0.6)))
+                if rt[0] is not None:
+                    # 只有圆角重建比整平基本面显著更贴网格体积时才采用，
+                    # 避免把本无圆角的件硬套上小 R（如 Monster8 微斜面）
+                    v_rt = _volume(rt[0])
+                    if v_rt is not None and vol > 0:
+                        err_r = abs(v_rt - vol) / vol
+                        if err_r < err0 - 0.003 and err_r < 0.05:
+                            round_ok = rt
+        if round_ok is None and err0 > 0.25:
+                # 原计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
+                # 多于主体板面）拉偏 → 面积加权中位把权重回归主体大平面
+                def _wmed(d_vals, w_vals):
+                    msk = np.isfinite(d_vals) & (w_vals > 0)
+                    d = np.asarray(d_vals, dtype=np.float64)[msk]
+                    w = np.asarray(w_vals, dtype=np.float64)[msk]
+                    if d.size == 0 or w.sum() <= 0:
+                        return np.nan
+                    i = np.argsort(d)
+                    cw = np.cumsum(w[i])
+                    k = int(np.searchsorted(cw, cw[-1] * 0.5))
+                    k = min(k, d.size - 1)
+                    return float(d[i][k])
+                cz = (v[mesh.faces].mean(axis=1)) @ axis
+                wa_other = _wmed(cz[other], mesh.area_faces[other])
+                wa_side = _wmed(cz[side], mesh.area_faces[side])
+                z_other2 = max(wa_other, wa_side)
+                z_surf2 = min(z_surf, z_other2 - thickness)
+                t2 = abs(z_other2 - z_surf2)
+                if t2 >= 1e-9:
+                    est2 = poly.area * t2
+                    if abs(est2 - vol) / vol > 0.25:
+                        return None, None
+                    thickness = t2
+                    z_other = z_other2
+                    z_surf = z_surf2
+                    none_w = 1
+
+    # v0.3.0 验证：计数中位在真实板最准，但 shape_to_mesh 合成件顶点密度不均
+    # （沉孔台面点反而多）会拉偏，此时用面积加权中位回退（见体积校验失败处）
+    # --- 挤出基准面与高度 ---
     c = np.array(poly.centroid.coords[0], dtype=np.float64)
     z_base = z_surf if z_other > z_surf else z_surf - thickness
     # uv 原点的世界位置（孔环/外环为世界原点投影的绝对 uv；基准面过世界
@@ -1093,8 +1122,11 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         drill_axis = -drill_axis
 
     stats = {}
-    solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n,
-                           stats=stats)
+    if round_ok is not None and round_ok[0] is not None:
+        solid = round_ok[0]
+    else:
+        solid = _extrude_solid(poly, basis, origin, height_vec, plane_normal=plane_n,
+                               stats=stats)
     if solid is None:
         return None, None
 
@@ -1160,8 +1192,168 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         "counterbores": n_cb,
         "circles": stats.get("n_circ", 0),
         "obrounds": stats.get("n_ob", 0),
+        "edge_round": (round_ok[2], round_ok[1]) if round_ok else None,
     }
     return solid, info
+
+
+def _round_plate(solid, mesh, axis, plane_n, poly, z_surf, z_other,
+                 thickness, vol_target=None, max_err=0.08):
+    """检测并重建板件边缘的圆弧倒边（fillet）。
+
+    思路：板主体重建成功后，若体积仍与网格不符，往往是顶/底边界带等半径
+    圆弧倒边。这里用「对板 solid 施加 MakeFillet，按体积网格搜索半径 r」的
+    方式反推真实圆角，并以最小体积误差者作为重建结果。
+
+    返回 (shape, r_scanned这对侧信息, kind) / (None, None, None)。
+    """
+    if solid is None or solid.IsNull() or vol_target is None or vol_target <= 0:
+        return None, None, None
+
+    v = mesh.vertices
+    nrm = _face_normals(mesh.faces, v)
+    ang = np.arccos(np.clip(np.abs(nrm @ axis), 0, 1)) * 180 / np.pi
+    slope = np.where((ang >= 15) & (ang <= 75))[0]
+    if len(slope) == 0 or mesh.area_faces[slope].sum() / mesh.area_faces.sum() < 0.01:
+        return None, None, None
+
+    # 斜面顶点整体 z 带 → 顶侧 / 底侧
+    sv = np.unique(mesh.faces[slope])
+    sz = v[sv] @ axis
+    # 斜面 z 中位判定更偏顶还是底
+    z_med = float(np.median(sz))
+    top_z = max(float(z_surf), float(z_other))
+    bot_z = min(float(z_surf), float(z_other))
+    sides = []
+    if abs(z_med - top_z) < abs(z_med - bot_z):
+        sides.append(top_z)
+    else:
+        sides.append(bot_z)
+    # 若斜面 z 分布跨两侧（贴层很厚），双侧都试
+    if np.percentile(sz, 90) - np.percentile(sz, 10) > 0.5 * max(thickness, 0.5) \
+       and np.min(sz) < bot_z + 0.3 * thickness and np.max(sz) > top_z - 0.3 * thickness:
+        sides.append(bot_z if sides[0] == top_z else top_z)
+
+    def _side_edges(side_z):
+        """收集 solid 中 z≈side_z 且 uv 落在 poly 外周界上的边（排除孔缘）。"""
+        from OCP.TopoDS import TopoDS
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+        from OCP.BRep import BRep_Tool
+        import shapely.geometry as sg
+        exterior = sg.LineString(poly.exterior.coords)
+        edges = []
+        seen = set()
+        ex = TopExp_Explorer(solid, TopAbs_EDGE)
+        while ex.More():
+            e = TopoDS.Edge_s(ex.Current())
+            vv = []
+            zs = []
+            ve = TopExp_Explorer(e, TopAbs_VERTEX)
+            while ve.More():
+                p = BRep_Tool.Pnt_s(TopoDS.Vertex_s(ve.Current()))
+                vv.append((round(p.X(), 6), round(p.Y(), 6), round(p.Z(), 6)))
+                zs.append(p.Z())
+                ve.Next()
+            if len(zs) != 2:
+                ex.Next()
+                continue
+            key = tuple(sorted(vv))
+            if key in seen or abs(zs[0] - side_z) > 0.35 or abs(zs[1] - side_z) > 0.35:
+                ex.Next()
+                continue
+            seen.add(key)
+            # 该边两顶点 uv 是否贴近 poly 外环（世界原点为 uv 投影原点）
+            mid2 = ((vv[0][0] + vv[1][0]) / 2, (vv[0][1] + vv[1][1]) / 2)
+            if exterior.distance(sg.Point(mid2)) < 0.6:
+                edges.append(e)
+            ex.Next()
+        return edges
+
+    best = None
+    best_r = None
+    best_kind = None
+    best_fil = None
+    best_ch = None
+    r_max = min(3.0, thickness * 0.5) * 0.999
+    if r_max < 0.25:
+        return None, None, None
+    for r in np.arange(0.3, r_max + 1e-9, 0.15):
+        try:
+            from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+            mf = BRepFilletAPI_MakeFillet(solid)
+            any_add = False
+            for side_z in sides:
+                for e in _side_edges(side_z):
+                    mf.Add(float(r), e)
+                    any_add = True
+            if not any_add:
+                break
+            vv = _volume(mf.Shape())
+            if vv is None:
+                continue
+            err = abs(vv - vol_target) / vol_target
+            if best_fil is None or err < best_fil[0]:
+                best_fil = (err, float(r), vv)
+        except Exception:
+            continue
+
+    # 直倒角（chamfer 45°）同样按体积网格搜索
+    for a in np.arange(0.3, r_max + 1e-9, 0.15):
+        try:
+            from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+            mc = BRepFilletAPI_MakeChamfer(solid)
+            any_add = False
+            for side_z in sides:
+                for e in _side_edges(side_z):
+                    mc.Add(float(a), e)
+                    any_add = True
+            if not any_add:
+                break
+            vv = _volume(mc.Shape())
+            if vv is None:
+                continue
+            err = abs(vv - vol_target) / vol_target
+            if best_ch is None or err < best_ch[0]:
+                best_ch = (err, float(a), vv)
+        except Exception:
+            continue
+
+    # 误差到位才采用；fillet 与 chamfer 误差相当时优先 fillet（用户主诉求是
+    # 弧形倒边，且圆弧面是连续曲面更贴合真实打印/机加件边界）
+    if best_fil is not None and best_fil[0] <= max_err:
+        if best_ch is not None and best_ch[0] < best_fil[0] - 0.005:
+            best, best_r, best_kind = best_ch, best_ch[1], "chamfer"
+        else:
+            best, best_r, best_kind = best_fil, best_fil[1], "fillet"
+    elif best_ch is not None and best_ch[0] <= max_err:
+        best, best_r, best_kind = best_ch, best_ch[1], "chamfer"
+    else:
+        best = None
+
+    if best is None or best[0] > max_err:
+        return None, None, None
+
+    # 用最优 r 重跑一次拿到最终 shape
+    try:
+        if best_kind == "fillet":
+            from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+            fin = BRepFilletAPI_MakeFillet(solid)
+            for side_z in sides:
+                for e in _side_edges(side_z):
+                    fin.Add(best_r, e)
+        else:
+            from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+            fin = BRepFilletAPI_MakeChamfer(solid)
+            for side_z in sides:
+                for e in _side_edges(side_z):
+                    fin.Add(best_r, e)
+        out = fin.Shape()
+        if out.IsNull():
+            return None, None, None
+        return out, best_r, best_kind
+    except Exception:
+        return None, None, None
 
 
 def _volume_approx(mesh):
@@ -1222,8 +1414,14 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                 result.solid_count = 1
                 result.primitives = int(info["outer_pts"]) + int(info["hole_count"])
                 result.param_type = "plate"
-                note = "识别为带孔薄板（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
-                    info["outer_pts"], info["hole_count"], info["thickness"])
+                if info.get("edge_round"):
+                    kind, rr = info["edge_round"]
+                    note = "识别为带孔薄板 + 边缘{}R{:.2f}（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
+                        "圆弧倒边" if kind == "fillet" else "倒角",
+                        rr, info["outer_pts"], info["hole_count"], info["thickness"])
+                else:
+                    note = "识别为带孔薄板（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
+                        info["outer_pts"], info["hole_count"], info["thickness"])
             else:
                 result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
                 return result

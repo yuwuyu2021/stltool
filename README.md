@@ -8,7 +8,7 @@
 
 > 🧪 **这是一个仍在探索阶段的个人学习项目**——作者利用业余时间一点一点啃"网格 → 可编辑参数化实体"这块难骨头，代码还可能粗糙、结果可能出错。**你的每条意见、建议、甚至一句批评，都是这个项目最宝贵的养分。** 发现 bug 或想到更好的思路，欢迎直接 [提 Issue](https://github.com/yuwuyu2021/stltool/issues) 交流，期待你的声音。
 
-[![版本](https://img.shields.io/badge/最新版-v0.8.0-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
+[![版本](https://img.shields.io/badge/最新版-v0.9.0-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
 [![平台](https://img.shields.io/badge/平台-Windows-0078d6?style=flat-square)]()
 [![分发](https://img.shields.io/badge/单文件-免安装-orange?style=flat-square)]()
 [![许可](https://img.shields.io/badge/许可-AGPL--3.0-red?style=flat-square)](LICENSE)
@@ -61,7 +61,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 | --- | --- | --- |
 | 回转体 / 基本体素（板、柱、锥、球） | ✅ 已实现 | `parametric.py`：PCA 主轴 + 点面残差拟合，面数可降 99% |
 | 圆孔 / 沉孔 / 腰型孔 | ✅ 已实现 | `parametric.py`：通孔→解析圆柱面、沉孔→阶梯切除、腰型孔→两直段+两端圆弧重建 |
-| **倒角 / 弧形倒边** | 🔬 **探索主攻** | 机加工与打印件边缘最常见的特征，目前只能回退成碎片小三角面，参数化识别难度高；**尤其弧形倒边**是下一步最想啃下的骨头。欢迎提供相关 STL 样本和建议思路 |
+| **倒角 / 弧形倒边** | ✅ 实验版已实现 | `parametric.py` `_round_plate`：板边缘棱边逐一探测 `MakeFillet`/`MakeChamfer` 体积反演半径，合成 R2 圆角板 → fillet r=1.95（体积误差 0.12%）；但**真实件多为空腔壳体，圆角偏差与空腔混淆，有待壳体识别（M12）后进一步实战检验** |
 | 筋 / 凸台 | 🔬 探索中 | 壳体上的加强筋、凸台暂未专门识别 |
 | 螺纹孔 / 螺柱 / 沉头螺栓 | 🔬 探索中 | 尚无法可靠识别，需先攻克螺旋扫描方向判断等问题 |
 
@@ -72,7 +72,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 ## 🚀 快速开始（推荐）
 
 1. 打开 **[GitHub Releases 发布页](https://github.com/yuwuyu2021/stltool/releases/latest)**
-2. 在最新版本的 **Assets** 中下载 `STLTool-v0.8.0-win64-singlefile.exe`
+2. 在最新版本的 **Assets** 中下载 `STLTool-v0.9.0-win64-singlefile.exe`
 3. 双击运行（首次启动需解压，等待几秒属正常现象）
 
 > 💡 若系统提示"未知来源"，点击 **更多信息 → 仍要运行** 即可。单文件版无需联网、无需安装。

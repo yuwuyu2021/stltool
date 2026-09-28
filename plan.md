@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.8.0
+当前版本：v0.9.0
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -59,6 +59,11 @@
   - 方案演进（两轮证伪后收敛）：① `fast-simplification` 各参数组合均残留 14~32 条 non-manifold 边（multi≥3），drop+fan-fill 迭代陷入 6 条不可消除稳态环 → 弃用；② 低角度残差 patch 合并——`region_boundary_loops` 将小面按邻接 BFS 聚合为 patch，用平均平面重建单个 face，9°/6°/4.5°/3° 下有效合并率仅 7.8~10%，且大面积 wire 平面投影自交致整体无效 → 判定不适用于自由曲面模型，默认关，小模型共面区仍可受益。③ 收敛方案：**超 8 万面自动 QEM 简化**（pymeshlab `meshing_decimation_quadric_edge_collapse(targetfacenum=40000, preservetopology=True, planarquadric=True, autoclean=True)`，内存 MeshSet 无文件往返）→ 缝合面数直降一个量级；叠加 **面向网格外向法向对齐**（`_align_face_normal`，region/patch/逐三角三类面统一套用）。
   - ✅ 实测（本机 Windows，Benchy/3DBenchy.stl 225102 面）：pymeshlab 简化 40000 面、**watertight、multi=0、open=0、体积误差 -0.004%**、约 3~5s；端到端 convert+STEP 总 **≈120s（convert 97~102s + step write 15~16s）→ STEP 99.1MB**（原 570MB / 用户机 ~965s / 本机 15min 未跑完）。14 测试全绿。
   - ⛔ 已知遗留（另立工单）：缝合得到的 solid 严格 `BRepCheck_Analyzer.IsValid()` 仍返回 False；微四面体对照实验显示 edge 两侧 face marker 全 FORWARD 并不导致 invalid（`(16,59790,3)` 型定向分布是红鲱鱼），真正根因（面自交 / 壳内部连通性/子壳）未最终定位，属长期潜伏缺陷而非本次回归。BFS 翻转重建、ReShape 替换、ShapeFix_Shape 三种修复路径均已证伪或无效。
+- [x] M11 板件边缘圆弧倒边/倒角识别（v0.9.0，已完成）
+  - 需求来源：板件顶/底边缘带 R 圆角（fillet）或 45° 倒角（chamfer）时，M8 整平直板拟合因斜面带丢体积（真实件体积误差 → -13%~-15%），且整体参数化容易 MISS（合成 R2 圆角板全 MISS）。
+  - 方案：`detect_plate` 体积校验失败（误差 >25%）**或斜面占比 >3%** 时，先建板主体 solid（`_extrude_solid`）再由 `_round_plate` **体积反演网格搜索**——对顶/底面板边缘棱边（`_side_edges`：z 近端面的边，去重 + 边中点距外环 <0.6 排除孔缘）逐个 `MakeFillet`/`MakeChamfer`，半径/倒角量 `r∈[0.3, min(3.0, 厚度*0.5)*0.999]` 步长 0.15 扫描，取体积误差最小的 (kind, r)；**fillet 与 chamfer 误差接近时优先 fillet**（主诉求为弧形倒边）；仅当结果比整平基本面显著更贴网格体积（`err_r < err0-0.003` 且 `<0.05`）才采纳入 `info["edge_round"]`，避免把无圆角件硬套小 R。
+  - ✅ 实测（合成双向板，`_round_plate` 闭环）：R2 圆角板 → **fillet r=1.95、体积误差 0.12%**；2mm 倒角板 → **chamfer r=1.95、误差 0.29%**；类别与半径均正确；纯矩形板不误报。真实件全量回归无破坏（原 plate/revolve/MISS 分布不变）。15 扫描步进 ×2 通道替代原 0.2 步长：上界 厚度*0.5 覆盖 R=2.0 临界点。
+  - ⛔ 范围说明 / 遗留：真实 3D 打印件（Klicky开关座扣盖 -15.2%、Klicky支架扣盖 -13.6% 等）经深挖确认体积偏差主因是**空腔薄壁壳体**（`poly.area×厚` 满板体积超过实体体积 111%）而非边缘圆角——圆角识别对"实心圆角板"有效，壳体现在被正确拒绝（不误标成圆角板）。空腔/壳体识别是更贴合真实件的方向，另立 M12 待办。另注：`detect_plate` 端到端路径下 poly 外轮廓含斜角锯齿边时 `_side_edges` 匹配会降级（合成闭环在算法级直调稳定，端到端脆），故回归测试在算法级。
 
 ## 量化指标
 - 转换成功率：闭合网格 100%，轻度开放网格 ≥90%（当前测试：闭合 100%）
@@ -88,3 +93,4 @@
 - v0.7.1：使用 `project-github-avatar` 技能按项目名生成 GitHub identicon 风格图标（5×5 镜像像素图案 + 独立配色哈希），产出 512 PNG、SVG 与 16~256 八尺寸 ICO；`STLTool.spec` 与引导器 `STLTool_min.spec` 统一使用新图标，README 展示图标并纳入版本管理。
 - v0.7.2：**转换进度可视化完善**——真实 Benchy 实测（1907 解析区 + 22.4 万残差面）暴露两缺陷：① 参数化命中瞬间跳 92% 后回退 6%（进度条倒退）；② 残差缝合后进入 OCC `sewing.Perform()`/壳体提取/校验无任何回显，长时间停在 91%。修复：`app.py` 进度状态机按阶段分区映射（参数化检测 6~30%、解析面区域拟合 46~68%、残差三角面逐面缝合 66~92%，只进不退）；`analytic.py` 尾程插桩三处哨兵（93% 缝合全部面 / 94% 提取壳体实体 / 97% BRepCheck 校验），消除卡顿假象。
 - v0.8.0：**大网格性能轮（M10）**——pipeline 新增 `ConvertOptions.simplify_large`（默认开，>8 万面自动 pymeshlab QEM 简化至 4 万，缺依赖优雅跳过并记 notes）；`analytic.py` 新增 `_align_face_normal`（平面 face 法向对齐网格向外）并套用于解析区/低角度 patch/逐三角三类面，新增低角度残差 patch 合并（`residual_patch_deg`，有效合并率实测仅 ~8.5%、失真，默认 9.0 且大面积退回逐三角，小模型共面区受益）。端到端：Benchy 15min+/570MB → **≈120s / 99.1MB**；14 测试全绿。
+- v0.9.0：**板件边缘圆弧倒边/倒角识别（M11，未发布）**——`parametric.py` 新增 `_round_plate`（体积反演 fillet/chamfer 半径扫描，fillet 优先）+ `detect_plate` 集成（斜面占比>3% 或体积误差>25% 触发；仅显著优于整平基本面才采纳，避免误套小 R）+ `info["edge_round"]` 输出"带孔薄板 + 边缘圆弧倒边/倒角 R…"。修复 round 分支引用未定义 `basis/origin/height_vec`（顺序重排）+ 步进 0.15/上界 厚度*0.5 覆盖 R=2.0 临界点。合成闭环：R2 圆角→fillet r=1.95 (0.12%)、2mm 倒角→chamfer r=1.95 (0.29%)、矩形板不误报；真实件全量回归无破坏（扣盖类偏差实为空腔壳体，正确拒绝）。新增 3 测试（`test_round_plate_fillet_closedloop`/`_chamfer_closedloop`/`_plain_no_false_positive`），17 测试全绿。
