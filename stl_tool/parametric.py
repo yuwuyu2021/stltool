@@ -1193,6 +1193,10 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
                     solid = cut.Shape()
                     n_cb += 1
 
+    # ---- 凸台/沉台（表面浮雕）识别：显著离群水平面组挤出台体 Fuse ----
+    solid, n_boss = _detect_bosses(solid, mesh, axis, basis, plane_n,
+                                   z_surf, z_other, thickness)
+
     info = {
         "outer_pts": len(poly.exterior.coords),
         "hole_count": len(poly.interiors),
@@ -1202,6 +1206,7 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         "circles": stats.get("n_circ", 0),
         "obrounds": stats.get("n_ob", 0),
         "edge_round": (round_ok[2], round_ok[1]) if round_ok else None,
+        "bosses": n_boss,
     }
     return solid, info
 
@@ -1363,6 +1368,113 @@ def _round_plate(solid, mesh, axis, plane_n, poly, z_surf, z_other,
         return out, best_r, best_kind
     except Exception:
         return None, None, None
+
+
+def _detect_bosses(solid, mesh, axis, basis, plane_n, z_surf, z_other, thickness,
+                   max_bosses=16):
+    """板件表面凸台/沉台（浮雕）识别——把显著离群的水平面组挤出台体 Fuse 到板。
+
+    沿厚度轴评估：水平面组中 z 高于主顶面 `z_other` 的为顶侧凸台、低于主底面
+    `z_surf` 的为底侧裙/脚台。候选组面片投影（unary_union）经 `_extrude_solid`
+    挤出台体并与当前 solid Fuse；按「BRepCheck valid 且体积误差绝对值继续缩小」
+    贪心采纳，无益/异常一律回退原 solid（绝不劣化）。
+
+    返回 (final_solid, n_boss)。
+    """
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.BRepCheck import BRepCheck_Analyzer
+
+    try:
+        mesh_vol = float(mesh.volume)
+        if mesh_vol is None or mesh_vol <= 0 or solid is None or solid.IsNull():
+            return solid, 0
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = axis / np.linalg.norm(axis)
+        nrm = _face_normals(mesh.faces, mesh.vertices)
+        hz = np.abs(nrm @ axis) > 0.9
+        fsel = np.where(hz)[0]
+        if len(fsel) < 20:
+            return solid, 0
+        v = mesh.vertices
+        fz = mesh.faces
+        aff = mesh.area_faces[fsel]
+        zz = (v[fz[fsel]].mean(axis=1)) @ axis
+        ptp = float(zz.max() - zz.min())
+        if ptp <= 1e-9:
+            return solid, 0
+        tol = 0.02 * ptp
+        bucket = np.round(zz / tol).astype(int)
+        gzc = np.zeros(bucket.max() + 1, dtype=np.float64)
+        np.add.at(gzc, bucket, aff)
+        principal = float(gzc.max())
+
+        z_top = max(z_other, z_surf)
+        z_bot = min(z_other, z_surf)
+        min_gap = max(0.8, 0.15 * thickness)
+        if z_top - z_bot < 1e-9:
+            return solid, 0
+
+        items = []
+        for k in np.unique(bucket):
+            k = int(k)
+            a = float(gzc[k])
+            if a < max(10.0, 0.02 * principal) or a > 0.85 * principal:
+                continue
+            zk = float(zz[bucket == k].mean())
+            if zk >= z_top + min_gap:
+                sgn = 1.0
+            elif zk <= z_bot - min_gap:
+                sgn = -1.0
+            else:
+                continue
+            pols = [sg.Polygon(mesh.triangles[i] @ basis.T) for i in fsel[bucket == k]]
+            merged = unary_union(pols)
+            blocks = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+            for b in blocks:
+                if b.area < 1e-9 or b.area > 0.85 * principal:
+                    continue
+                items.append((zk, sgn, b))
+        if not items:
+            return solid, 0
+
+        cur = solid
+        cur_err = abs(float(_volume(cur)) / mesh_vol - 1.0)
+        n = 0
+        for zk, sgn, b in sorted(items, key=lambda t: (t[0], t[1], -t[2].area)):
+            if sgn > 0:
+                origin = axis * z_top
+                hv = axis * (zk - z_top)
+            else:
+                origin = axis * zk
+                hv = axis * (z_top - zk)
+            boss_s = _extrude_solid(b, basis, origin=origin, height_vec=hv,
+                                    plane_normal=plane_n, rdp_eps=0.3)
+            if boss_s is None or boss_s.IsNull():
+                continue
+            if _volume(boss_s) is None or float(_volume(boss_s)) <= 0:
+                continue
+            try:
+                fused = BRepAlgoAPI_Fuse(cur, boss_s).Shape()
+            except Exception:
+                continue
+            if fused is None or fused.IsNull():
+                continue
+            if not BRepCheck_Analyzer(fused).IsValid():
+                continue
+            vf = float(_volume(fused))
+            if vf is None or vf <= 0:
+                continue
+            err = abs(vf / mesh_vol - 1.0)
+            if err < cur_err - 0.0005:
+                cur, cur_err = fused, err
+                n += 1
+                if n >= max_bosses:
+                    break
+        return cur, n
+    except Exception:
+        return solid, 0
 
 
 def _solid_gap_ratio(mesh, axis, vol):

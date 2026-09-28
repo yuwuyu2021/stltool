@@ -8,7 +8,7 @@
 
 > 🧪 **这是一个仍在探索阶段的个人学习项目**——作者利用业余时间一点一点啃"网格 → 可编辑参数化实体"这块难骨头，代码还可能粗糙、结果可能出错。**你的每条意见、建议、甚至一句批评，都是这个项目最宝贵的养分。** 发现 bug 或想到更好的思路，欢迎直接 [提 Issue](https://github.com/yuwuyu2021/stltool/issues) 交流，期待你的声音。
 
-[![版本](https://img.shields.io/badge/最新版-v0.10.1-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
+[![版本](https://img.shields.io/badge/最新版-v0.11.0-2ea44f?style=flat-square)](https://github.com/yuwuyu2021/stltool/releases)
 [![平台](https://img.shields.io/badge/平台-Windows-0078d6?style=flat-square)]()
 [![分发](https://img.shields.io/badge/单文件-免安装-orange?style=flat-square)]()
 [![许可](https://img.shields.io/badge/许可-AGPL--3.0-red?style=flat-square)](LICENSE)
@@ -62,7 +62,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 | 回转体 / 基本体素（板、柱、锥、球） | ✅ 已实现 | `parametric.py`：PCA 主轴 + 点面残差拟合，面数可降 99% |
 | 圆孔 / 沉孔 / 腰型孔 | ✅ 已实现 | `parametric.py`：通孔→解析圆柱面、沉孔→阶梯切除、腰型孔→两直段+两端圆弧重建 |
 | **倒角 / 弧形倒边** | ✅ 实验版已实现 | `parametric.py` `_round_plate`：板边缘棱边逐一探测 `MakeFillet`/`MakeChamfer` 体积反演半径，合成 R2 圆角板 → fillet r=1.95（体积误差 0.12%）；**真实件多为空腔壳体**——M12 起走诚实拒绝策略：`_solid_gap_ratio` 把空腔薄壁件拒为 MISS（不误标圆角/薄板），壳体重建留作后续 |
-| 筋 / 凸台 | 🔬 探索中 | 壳体上的加强筋、凸台暂未专门识别 |
+| 筋 / 凸台 | ✅ 实验版已实现 | `parametric.py` `_detect_bosses`：沿厚度轴找高于主顶面/低于主底面的显著水平面组，面片投影挤出台体 Fuse 到板主体，按体积误差贪心采纳（Monster8 板安装架 -2.2%→**-0.18%**，四脚台归位；普通板零误伤） |
 | 空腔薄壁壳体 | 🔧 识别并诚实拒绝 | `parametric.py` `_solid_gap_ratio`：沿厚度轴「最大水平主面面积 × 全跨距」/ 实际体积 >1.35 判为空腔/镂空，拒绝薄板参数化并提示走逐三角/analytic（Klicky开关座扣盖假阳性 plate -15.2% → MISS）；**等壁厚壳体重建**仍待实现 |
 | 螺纹孔 / 螺柱 / 沉头螺栓 | 🔬 探索中 | 尚无法可靠识别，需先攻克螺旋扫描方向判断等问题 |
 
@@ -73,7 +73,7 @@ STEP 才是 CAD 世界的"正规军"——参数化**实体（Solid）**，面�
 ## 🚀 快速开始（推荐）
 
 1. 打开 **[GitHub Releases 发布页](https://github.com/yuwuyu2021/stltool/releases/latest)**
-2. 在最新版本的 **Assets** 中下载 `STLTool-v0.10.1-win64-singlefile.exe`
+2. 在最新版本的 **Assets** 中下载 `STLTool-v0.11.0-win64-singlefile.exe`
 3. 双击运行（首次启动需解压，等待几秒属正常现象）
 
 > 💡 若系统提示"未知来源"，点击 **更多信息 → 仍要运行** 即可。单文件版无需联网、无需安装。

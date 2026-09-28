@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.10.1
+当前版本：v0.11.0
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -48,7 +48,7 @@
   - ✅ 已完成（v0.2.0）基础版：`detect_plate`——PCA 厚度轴 + 大平面单侧面片投影聚合（shapely union 外环+孔）× 两侧评估 → 板厚估计（对侧表面轴向中位/百分位）→ OCP 挤出外环 + 逐孔布尔减（`_extrude_solid`，RDP 简化轮廓点到容差等级，全环节 try-except 兜底）。识别条件：侧面占比 ≥25%、扁率厚度/主尺寸 <0.5、体积估值误差 <25%，全部满足才接受以避免误判。实测：**侧板A 23918→346 面（-98.5%）、valid、体积误差 +0.6%、STEP 1.4MB（mesh 模式 >10MB）**；侧板B/C/D 及同步轮盖板为曲面/壳体件（单侧面占比仅 12-24%）合理拒绝仍走回退。新增测试 `test_convert_parametric_plate`（合成带孔板 3 孔，面数降 >90%，体积误差 <15%）。（12 测试全绿）
   - ✅ 已完成（v0.4.0）沉孔/台阶识别：顶面低洼簇（`top_z < z_other - max(0.8, 0.15*thickness)`）与孔中心近窗（`dist < 2r+2`）匹配，台面判据——孔心区低洼点占比 <35%（排除"孔落在大下沉槽"）、台半径 95 分位 ∈ [r+0.4, 2.4r]（真沉孔台有限宽）、台 z 离散度小（共面）、台深 >20% 板厚；命中即 `MakeCylinder(z_sunk, r_cb)` 布尔减。主体面高度改用"计数中位主 + 面积加权中位回退"（修复 shape_to_mesh 合成件台面顶点密度不均把顶面高度拉偏，侧板A 顶面 p50 最准）。实测：**侧板A 181→186 面（新增 2 沉孔圆柱面）、valid、体积误差 +0.21%（较 v0.3.0 +0.4% 更准）**；合成沉孔板（40×30×4，通孔 r2.5 + 台面 r5 深 2）命中 1 沉孔、误差 -0.15%。新增测试 `test_convert_parametric_counterbore`。
   - ✅ 已完成（v0.5.0）非圆孔圆角化（腰型/长条孔两端圆弧化）：`hole_is_obround` 判定——PCA 长轴下环点集到"两直段+两圆弧"边界曲线距离均方根 ≤0.3r、腰型面积与环面积一致性 ≥90%，返回 (圆心中点, 长轴, 圆心距 d, 半径 r)；`_extrude_solid` 内 `make_obround_cut` 用 `MakeEdge` 直线段 + `MakeEdge(gp_Circ, P1, P2)` 圆弧（参数增大方向裁剪，避免跨参数缝）构造腰型面并挤出，替代原逐点多边形 wire 布尔减。**并修复板件全局平移 bug**：`origin` 原叠加 uv centroid 致整个挤出体偏移 +c（体积平移不变故此前未被发现），改为 `axis*z_base`（uv 为世界原点投影绝对坐标）。实测：**侧板A 186→168 面、valid、体积误差 +0.18%**；合成腰型孔板（60×40×4，r4 + d24）536→10 面（8 平面 + **2 解析圆柱端面**）、误差 ~0%。新增测试 `test_convert_parametric_obround`（断言 2 圆柱面）。
-  - ⏳ 待办：凸台/筋识别（侧板A 已见 z≈7.5 与 z≈11 两组凸起）。
+  - ✅ 已完成（v0.11.0）凸台/沉台识别：`_detect_bosses` 沿厚度轴找高于主顶/低于主底的显著水平面组，面片投影 unary_union 挤出台体 Fuse 到板，按「BRepCheck valid 且体积误差继续缩小」贪心采纳。侧板A 铅笔样件（旧样本）已不在样本库；Monster8 板安装架（四脚台）误差 -2.21%→**-0.18%**，合成凸台板 2 柱 err≤3%。后续如需覆盖真实"筋"件（侧向加强筋非顶/底平面台）需另立。
 - [x] M9 孔洞解析圆柱面输出（v0.3.0，已完成）
   - 需求来源：M8 板件重建中圆孔仍用逐点 wire 布尔减，STEP 里孔侧壁是一堆小三角面，面数可进一步压缩且不"解析"。
   - 目标：把判定为真圆的通孔用 `BRepPrimAPI_MakeCylinder` 解析圆柱面布尔减替换 wire。
@@ -102,3 +102,4 @@
 - v0.9.0：**板件边缘圆弧倒边/倒角识别（M11，未发布）**——`parametric.py` 新增 `_round_plate`（体积反演 fillet/chamfer 半径扫描，fillet 优先）+ `detect_plate` 集成（斜面占比>3% 或体积误差>25% 触发；仅显著优于整平基本面才采纳，避免误套小 R）+ `info["edge_round"]` 输出"带孔薄板 + 边缘圆弧倒边/倒角 R…"。修复 round 分支引用未定义 `basis/origin/height_vec`（顺序重排）+ 步进 0.15/上界 厚度*0.5 覆盖 R=2.0 临界点。合成闭环：R2 圆角→fillet r=1.95 (0.12%)、2mm 倒角→chamfer r=1.95 (0.29%)、矩形板不误报；真实件全量回归无破坏（扣盖类偏差实为空腔壳体，正确拒绝）。新增 3 测试（`test_round_plate_fillet_closedloop`/`_chamfer_closedloop`/`_plain_no_false_positive`），17 测试全绿。
 - v0.10.0：**空腔/镂空件诚实拒绝（M12，未发布）**——`parametric.py` 新增 `_solid_gap_ratio`（厚度轴水平主面组面积×全跨距/实际体积，主面分组聚合 + 轴正规化）+ `detect_plate` 成功路径无条件拦网（比值>1.35 拒绝并给 `reject_reason`，`convert_parametric` 定制消息）。真实样本全量回归：Klicky开关座扣盖假阳性（原 plate -15.2%）→ MISS+空腔提示；全部真实 plate 无一误伤（三轴 max 曾误伤定位板安装架，回单轴解除；轴噪声曾致扣盖 ratio 2.0→0.93 漏拒，正规化修复）。新增 2 测试（`test_plate_cavity_reject`/`_plate_solid_not_rejected`），19 测试全绿。
 - v0.10.1：**revolve 空腔行为锁定（未发布）**——侦察确认 `detect_revolve` 对空腔盒由既有 0.30 体积护栏自然拦截（convert→fallback），新增回归测试 `test_revolve_hollow_not_false_positive` 锁定；护栏收紧 0.15 因合成酒杯固有拟合误差 28.45% ≥ 真实件 27.2% 不可行已回滚。Klicky支架扣盖归因凹槽剥壳（M8 语义）非空腔。20 测试全绿。
+- v0.11.0：**凸台/沉台识别（M8 遗留，未发布）**——`parametric.py` 新增 `_detect_bosses`：沿厚度轴找高于主顶面/低于主底面的显著水平面组，面片投影 unary_union 挤出台体并与板主体 Fuse，按「BRepCheck valid 且体积误差绝对值继续缩小」贪心采纳（无益/异常回退原 solid，绝不过拟合）。真实回归：Monster8 板安装架 -2.21%→**-0.18%**（bosses=5，四脚台归位）、Klicky支架扣盖 -13.6%→-10.35%（bosses=2）、刷头安装架 -13.9%→-11.6%；普通板（盖板L/sherpa）零误伤。新增测试 `test_plate_boss_recovered`（合成凸台板 err≤3%）/`test_plate_boss_no_false_positive`（普通板 bosses=0），22 测试全绿。

@@ -540,6 +540,48 @@ def test_revolve_hollow_not_false_positive():
         "空腔盒不应被拟合为回转体，实际 {}".format(getattr(r, "param_type", None)))
 
 
+def test_plate_boss_recovered():
+    """带凸台板的板参数化：凸台柱被 Fuse 回板体，体积误差显著收敛。"""
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh
+    from stl_tool.parametric import detect_plate, _volume
+
+    # 40×30×4 板 + 2 个 r4、高 6 的凸台柱（z=4→10）
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40, 30, 4).Shape()
+    c1 = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(10, 10, 0), gp_Dir(0, 0, 1)), 4, 10).Shape()
+    c2 = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(30, 20, 0), gp_Dir(0, 0, 1)), 4, 10).Shape()
+    solid = BRepAlgoAPI_Fuse(BRepAlgoAPI_Fuse(box, c1).Shape(), c2).Shape()
+    mesh, _ = prepare_mesh(shape_to_mesh(solid, 0.4, 0.4))
+    shape, info = detect_plate(mesh)
+    assert shape is not None, "带凸台板应识别为 plate，实际 None"
+    assert info["bosses"] >= 2, "应识别出 2 个凸台柱，实际 {}".format(info["bosses"])
+    vol = float(_volume(shape))
+    err = abs(vol / float(mesh.volume) - 1.0)
+    assert err <= 0.03, "凸台拟合后体积误差应 <=3%，实际 {:.2f}%".format(err * 100)
+
+
+def test_plate_boss_no_false_positive():
+    """普通带孔板（无凸台）：_detect_bosses 不得误加任何台体。"""
+    import shapely.geometry as sg
+    import trimesh
+    from stl_tool.pipeline import prepare_mesh
+    from stl_tool.parametric import detect_plate
+
+    poly = sg.box(0, 0, 40, 30)
+    for (cx, cy) in ((10, 10), (30, 20)):
+        poly = poly.difference(sg.Point(cx, cy).buffer(3.0))
+    mesh = trimesh.creation.extrude_polygon(poly, 4)
+    mesh, _ = prepare_mesh(mesh)
+    shape, info = detect_plate(mesh)
+    assert shape is not None
+    assert info.get("bosses", 0) == 0, (
+        "普通板不应识别出凸台，实际 {}".format(info.get("bosses", 0)))
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
