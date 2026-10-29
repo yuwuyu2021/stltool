@@ -1,6 +1,6 @@
 # STL 转可编辑实体 STEP 工具 项目计划
 
-当前版本：v0.12.0
+当前版本：v0.12.1
 
 ## 目标
 开发一个带完整 GUI 的 Windows 工具：读取 STL 三角网格，自动分析网格质量与拓扑结构，自动选择策略重建为 B-Rep 实体（Solid），并导出为 CAD 软件可打开、可编辑的 STEP 文件（AP203/AP214）。
@@ -23,20 +23,21 @@
   - ✅ 已完成：mesh_analyzer、solid_builder、step_exporter、pipeline；测试通过（box/sphere/开放网格补孔/无补孔导出/STEP）
 - [x] M2 完整 GUI：文件打开/拖放、3D 预览、分析结果面板、导出参数、进度与日志
   - ✅ 已完成：PyQt6 + pyqtgraph OpenGL 预览、边界/法向高亮、后台线程转换、进度条、日志、导出对话框
-- [ ] M3 自动修复与鲁棒性：孔洞修补、缝合容差调节、多体/多壳处理、失败诊断建议、大网格精简
-  - ⏳ 部分完成：孔洞修补、法向修复、退化面清理、缝合容差、多壳导出宏、大网格自动简化（见 M10）。待办：更精细的失败诊断
+- [x] M3 自动修复与鲁棒性：孔洞修补、缝合容差调节、多体/多壳处理、失败诊断建议、大网格精简
+  - ✅ 已完成：孔洞修补、法向修复、退化面清理、缝合容差、多壳导出宏、大网格自动简化（见 M10）
+  - ✅ 失败诊断（v0.12.1）：参数化未命中自动回退时，`pipeline.convert` 把具体拒绝原因写入 `prep_notes`（如"参数化重建未命中：无法由基本体素（方块/圆柱/圆锥/球/回转体/拉伸板）表示。已自动回退面拟合/缝合法。"），`app.py` 在日志逐条输出 `说明：…`；同步把简化提示文案的体积误差由 0.01% 校正为实测 0.004%。新增测试 `test_param_fallback_reports_reason`（torus → fallback + 备注含原因），26 测试全绿。
 - [x] M4 打磨发布：单元测试、性能优化、打包脚本（PyInstaller）、README、文档
-  - ✅ 完成：核心单元测试（22 全绿）、README、打包脚本（STLTool.spec 单文件 326.8MB）与 **v0.11.0 发布**（GitHub Releases tag v0.11.0，2026-09-28；gh release create + 326.8MB asset 经直连上传；此前 v0.8.0~v0.11.0 累积功能一并随此版发布）
+  - ✅ 完成：核心单元测试（25 全绿）、README、打包脚本（STLTool.spec 单文件 326.8MB）与 **v0.12.0 发布**（GitHub Releases tag v0.12.0，2026-10-29；gh release create + 326.8MB asset（sha256 `152c1d6e…8906cf7`）；v0.8.0~v0.12.0 累积功能随此版发布）
   - ✅ v0.0.5 修复极小退化面导致实体无效的缺陷：真实扳机 STL（含面积 ~1e-6 退化面）经"清理退化面+自动补孔"产出合法闭合实体（BRepCheck valid），新增回归测试 tests/fixtures/block26_trigger.stl
   - ⏳ 自举安装式最小 exe（bootstrap）：内嵌嵌入式 Python(python-embed)，首次运行在 exe 所在目录自动创建 runtime/.venv、下载 get-pip 并 pip 安装依赖、复制应用源码，之后直接启动，秒开。待办：引导器多国内 pip 源+自动切换、日志文件、失败弹窗、（暂停中）
 - [x] M5 STL 网格编辑与面片合并（v0.0.6，已完成）
   - 需求来源：Shapr3D 导入真实 STEP 底面显示空（源 STL 底部局部凹痕 59 个小面法向朝内，CAD 背面剔除导致）；用户要求可编辑源网格。
   - 功能：① 旋转（X/Y/Z，含 90°快捷）② 镜像（X/Y/Z 平面）③ 共面合并成大面（减少 STEP 面数）④ 交互选中多个面片合并、预览高亮 ⑤ 预览显示面片数
   - ✅ 已完成：旋转/镜像/共面合并滑块/面片计数/Shift+点击选面合并均实现并单测通过（box 192→84面保持水密体积不变）
-- [ ] M6 面拟合生成 analytic STEP（进行中，v0.0.8 目标）
+- [x] M6 面拟合生成 analytic STEP（v0.0.8，已完成）
   - 需求来源：纯网格化缝合的 STEP 面数高（扳机 2224 面），Shapr3D 易显示成"空壳/卡顿"；采用"面拟合生成 analytic STEP"方案根治。
   - 目标：新增**面拟合导出模式**——网格区域分割 → 解析曲面拟合（平面/圆柱/圆锥/球, PCA+最小二乘+残差选型）→ 边界环提取 → 用 OCP 构造 analytic face（gp_Pln/Cylinder/Cone/Sphere）→ 缝合建 solid。其余无法拟合区域退回平面分片网格化。保留原缝合导出作回退。
-  - ✅ 待办：区域分割、曲面拟合、边界环、OCP analytic face 构建、集成、验证（面数降几十、valid、水密、体积近似）
+  - ✅ 待办：区域分割、曲面拟合、边界环、OCP analytic face 构建、集成、验证（面数降几十、valid、水密、体积近似）→ 已于 v0.0.8 全部完成，见下条
   - ✅ 已完成（v0.0.8）：`analytic.py` 模块——曲面拟合（平面 PCA / 圆柱/圆锥/球最小二乘，法向散度定轴+残差选型，修复圆柱半径符号、圆锥误判圆柱）、法向连续性区域分割+全局重拟合+同向共面合并（修复反向平行面误合并，box→6 平面面）、边界环半-edge 追迹、OCP analytic face 构建与外向法向校验、保守混合缝合（解析平面面+残余逐三角）。**关键修复：仅当 analytic face BRepCheck 单独合法才合并，否则该区退回逐三角**——解决了"部分 analytic 平面面非法导致整体实体 invalid"问题，扳机 analytic 导出现为 **valid、实心（内部点命中 ~39.5%、体积 3572，体积非 0 非空壳）**。新增测试 `test_convert_analytic`。**注**：真实扳机 STL 需经 `prepare_mesh`（朝外法向+补孔+清退化面）与 tolerance=0.05 才得合法实体，此前直接逐三角亦 invalid 属既有网格质量/容差问题，analytic face 校验修复后默认与 analytic 双路径均 valid。
 - [x] M7 参数化重建：基本体素 + 回转体（v0.1.0，已完成）
   - 目标：不引入大模型，用纯算法整体识别 STL 为规则几何体（box/cylinder/cone/sphere/回转体），用 OCP 参数化原语（MakeBox/MakeCylinder/MakeCone/MakeSphere/MakeRevol）重建为面数极少的 B-Rep 实体。
@@ -114,3 +115,5 @@
 - v0.11.0：**凸台/沉台识别（M8 遗留，已发布）**——`parametric.py` 新增 `_detect_bosses`：沿厚度轴找高于主顶面/低于主底面的显著水平面组，面片投影 unary_union 挤出台体并与板主体 Fuse，按「BRepCheck valid 且体积误差绝对值继续缩小」贪心采纳（无益/异常回退原 solid，绝不过拟合）。真实回归：Monster8 板安装架 -2.21%→**-0.18%**（bosses=5，四脚台归位）、Klicky支架扣盖 -13.6%→-10.35%（bosses=2）、刷头安装架 -13.9%→-11.6%；普通板（盖板L/sherpa）零误伤。新增测试 `test_plate_boss_recovered`（合成凸台板 err≤3%）/`test_plate_boss_no_false_positive`（普通板 bosses=0），22 测试全绿。
 - v0.11.0 发布记录：GitHub Releases tag v0.11.0（[releases/tag/v0.11.0](https://github.com/yuwuyu2021/stltool/releases/tag/v0.11.0)），单文件 `STLTool-v0.11.0-win64-singlefile.exe`（326.8MB，sha256 `550dfb9c…b4ba0706`）；v0.8.0~v0.11.0 累积功能随此版发布。
 - v0.12.0：**等壁厚壳体重建（M13）**——`parametric.py` 新增 `_detect_shell`（水平面组 → 最大组为外壳截面、内部 25%~92% 面积组为内腔，按有无配对面区分封闭腔/开口腔）+ `_prism_poly`（MakeFace+MakePrism 轻量挤出，规避 `_extrude_manual` 对多顶点凹轮廓组出无效实体的问题）；接在「gap ratio >1.35 拒绝前」与「poly=None（薄壁件单侧面占比 <25%）」两处，误差 ≤12% 且 valid 才采纳。真实件 51 件全量回归：**7 件 MISS → 壳体、零回归**（Klicky开关座扣盖 +4.11%、Klicky停靠座 -8.59%、Klicky开关座 +8.46%、张紧座L +2.83%、张紧座R +6.54%、张紧轮座 -9.90%、集线板安装架 +2.13%）。合成封闭/开口薄壁盒闭环 -3.25%/-2.23%（wall 2.00）。新增 3 测试，25 测试全绿。
+- v0.12.0 发布记录：GitHub Releases tag v0.12.0（[releases/tag/v0.12.0](https://github.com/yuwuyu2021/stltool/releases/tag/v0.12.0)），单文件 `STLTool-v0.12.0-win64-singlefile.exe`（326.8MB，sha256 `152c1d6e…8906cf7`，publishedAt 2026-10-29T14:05:52Z）；v0.8.0~v0.12.0 累积功能随此版发布。tag 经 gh API 创建（直连 git push tag 被 reset 时段），release 创建/上传/发布均走 API。
+- v0.12.1：**M3 失败诊断收尾（未单独发布，随下一版累积）**——`pipeline.convert` 参数化未命中回退时把具体原因（原 `result.message` 去掉"请走逐三角或 analytic 模式"尾巴）写入 `prep_notes`；`app.py` 的 `_proc_convert` 返回新增 `notes`，批处理日志逐条输出 `说明：…`，用户可直接看到"为什么没用参数化"而无需推断。简化提示的体积误差文案 0.01% → 0.004%（实测值）。新增 `test_param_fallback_reports_reason`，26 测试全绿。

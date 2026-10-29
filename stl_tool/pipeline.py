@@ -116,7 +116,7 @@ def convert(mesh, options=None, progress_cb=None):
         before = len(m.faces)
         try:
             m = _simplify_mesh(m, opts.SIMPLIFY_TARGET_FACES)
-            notes.append("大网格自动简化：{} → {} 面（体积误差约 0.01%）。".format(
+            notes.append("大网格自动简化：{} → {} 面（体积误差约 0.004%）。".format(
                 before, len(m.faces)))
         except Exception:
             pass
@@ -126,12 +126,22 @@ def convert(mesh, options=None, progress_cb=None):
         result = convert_parametric(m, tolerance=opts.tolerance,
                                     progress_cb=progress_cb)
         if not result.has_solid():
-            # 参数化失败自动回退
+            # 参数化失败自动回退（把未命中的具体原因带进备注，便于用户判断）
             from .analytic import convert_analytic
+            reason = (result.message or "").strip()
+            for tail in ("，请走逐三角或 analytic 模式。", "。请走逐三角或 analytic 模式。",
+                         "请走逐三角或 analytic 模式。"):
+                if reason.endswith(tail):
+                    reason = reason[:-len(tail)].strip("，。 ")
+                    break
+            if reason:
+                notes = notes + ["参数化重建未命中：{}。已自动回退面拟合/缝合法。".format(reason)]
+            else:
+                notes = notes + ["参数化重建未命中，已自动回退面拟合/缝合法。"]
             result = convert_analytic(m, tolerance=opts.tolerance,
                                       progress_cb=progress_cb,
                                       residual_patch_deg=opts.residual_patch_deg)
-            result.prep_notes = notes + ["参数化重建未命中，自动回退面拟合/缝合法。"]
+            result.prep_notes = notes
             if not hasattr(result, "param_type"):
                 result.param_type = "fallback"
         else:

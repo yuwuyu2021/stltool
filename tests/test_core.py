@@ -637,6 +637,21 @@ def test_shell_not_false_positive_on_thick_block():
     assert shape is None, "实心块不应被识别为壳体"
 
 
+def test_param_fallback_reports_reason():
+    """参数化未命中自动回退时，prep_notes 必须带出具体原因（M3 失败诊断）。"""
+    import trimesh
+    from stl_tool.pipeline import convert, ConvertOptions
+
+    mesh = trimesh.creation.torus(major_radius=20, minor_radius=6,
+                                  major_segments=48, minor_segments=20)
+    opts = ConvertOptions()
+    opts.parametric = True
+    r = convert(mesh, opts)
+    notes = getattr(r, "prep_notes", []) or []
+    assert any("参数化重建未命中" in n for n in notes), notes
+    assert getattr(r, "param_type", "") == "fallback", getattr(r, "param_type", "")
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")

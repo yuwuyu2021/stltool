@@ -154,6 +154,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
         "vol_step": vol_step,
         "kind": kind,
         "n_new": n_new,
+        "notes": list(getattr(res, "prep_notes", []) or []),
         "seconds": time.time() - t1,
     }
 
@@ -213,6 +214,8 @@ class BatchWorker(QThread):
                     self.log_msg.emit("  重建：{} | 实体面 {} | 体积 网格 {:.3f} / STEP {:.3f}（{:+.1f}%），耗时 {:.1f}s".format(
                         res.get("kind", ""), res.get("n_new", 0), vol_m,
                         res.get("vol_step", 0.0), err, res.get("seconds", 0.0)))
+                    for note in res.get("notes", []) or []:
+                        self.log_msg.emit("  说明：" + str(note))
                     sm = res.get("step_mesh")
                     if sm is not None:
                         self.step_preview.emit(sm)
