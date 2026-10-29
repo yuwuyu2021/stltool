@@ -980,6 +980,79 @@ def _extrude_manual(outer_loop, basis, origin, height_vec, rdp_eps=0.2):
     return ms.Shape()
 
 
+def _prism_poly(poly2d, basis, origin, height_vec, rdp_eps=0.1,
+                min_hole_area=0.5):
+    """2D 多边形挤出实体（MakeFace + MakePrism，壳体重建专用轻量路径）。
+
+    与 _extrude_solid 的差别：不走手工壳组装——多顶点凹轮廓会让手工组装出
+    朝向错乱、体积失真的无效实体；此处直接用 OCC 的 MakePrism，并在体积为
+    负/不可计算时用 ShapeFix_Solid 修正整体朝向。孔洞以布尔切除处理。
+    返回 shape 或 None。
+    """
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace,
+    )
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.ShapeFix import ShapeFix_Solid
+    from OCP.TopoDS import TopoDS
+    import shapely.geometry as sg
+
+    def _prism(ring, hv):
+        pts = np.asarray(list(ring.coords), dtype=np.float64)
+        if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
+            pts = pts[:-1]
+        if rdp_eps and len(pts) > 8:
+            pts = _loop_rdp(pts, rdp_eps)
+        if len(pts) < 3:
+            return None
+        n3 = [origin + basis[0] * p[0] + basis[1] * p[1] for p in pts]
+        mw = BRepBuilderAPI_MakeWire()
+        for i in range(len(n3)):
+            e = BRepBuilderAPI_MakeEdge(gp_Pnt(*n3[i]),
+                                        gp_Pnt(*n3[(i + 1) % len(n3)]))
+            if not e.IsDone():
+                return None
+            mw.Add(e.Edge())
+        if not mw.IsDone() or mw.Wire().IsNull():
+            return None
+        mf = BRepBuilderAPI_MakeFace(mw.Wire(), True)
+        if not mf.IsDone():
+            return None
+        s = BRepPrimAPI_MakePrism(mf.Face(), gp_Vec(*hv)).Shape()
+        if s is None or s.IsNull():
+            return None
+        v = _volume(s)
+        if v is None or v < 0:
+            try:
+                sf = ShapeFix_Solid(TopoDS.Solid_s(s))
+                sf.Perform()
+                s = sf.Solid()
+            except Exception:
+                return None
+        return s
+
+    try:
+        hv = np.asarray(height_vec, dtype=np.float64)
+        solid = _prism(poly2d.exterior, hv)
+        if solid is None:
+            return None
+        for ring in poly2d.interiors:
+            hole = sg.Polygon(ring)
+            if hole.area < min_hole_area:
+                continue
+            cutter = _prism(ring, hv)
+            if cutter is None:
+                continue
+            cut = BRepAlgoAPI_Cut(solid, cutter)
+            if cut.IsDone():
+                solid = cut.Shape()
+        return solid
+    except Exception:
+        return None
+
+
 def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     """识别带孔薄板并重建为挤出实体。
 
@@ -993,6 +1066,12 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
     axis = _find_thickness_axis(mesh)
     poly, plane_n = _base_plane_profile(mesh, axis)
     if poly is None:
+        # 薄壁/壳体件单侧面占比常低于 25% 而拿不到主轮廓；此时直接尝试等壁厚
+        # 壳体近似（_detect_shell 自带面组判据，不依赖 poly）。
+        vol0 = _volume_approx(mesh)
+        shell, sinfo = _detect_shell(mesh, axis, vol0)
+        if shell is not None:
+            return shell, sinfo
         return None, None
 
     # 底面/顶面位置：法向平行 plane_n 的面片顶点轴向
@@ -1086,6 +1165,11 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
         if round_ok is None:
             gap = _solid_gap_ratio(mesh, axis, vol)
             if gap is not None and gap > 1.35:
+                # M13：拒绝前先尝试等壁厚壳体重建（薄壁盖/盒），成功则给出
+                # 可编辑近似实体；失败维持 M12 的诚实拒绝。
+                shell, sinfo = _detect_shell(mesh, axis, vol)
+                if shell is not None:
+                    return shell, sinfo
                 return None, {"reject_reason":
                     "检测到内部空腔/镂空（第二主面或双层壁），薄板参数化不适用"}
         if round_ok is None and err0 > 0.25:
@@ -1477,6 +1561,162 @@ def _detect_bosses(solid, mesh, axis, basis, plane_n, z_surf, z_other, thickness
         return solid, 0
 
 
+def _detect_shell(mesh, axis, vol, max_err=0.12):
+    """薄壁壳体（封闭盖/盒）等壁厚近似重建。
+
+    仅供 detect_plate 在空腔判定（gap ratio > 1.35）后、正式拒绝前调用：用水平
+    面面组重建「外壳挤出 − 内腔挤出」，若能给出体积误差 < max_err 的有效实体则
+    采纳，否则返回 None 维持诚实拒绝（不劣化原有行为）。
+
+    结构假设：外轮廓为单一截面（面积最大的水平面组投影，含孔）；内腔由一组位于
+    结构内部、面积为外轮廓 25%~92% 的水平面组界定，若上方存在等面积配对面则按
+    封闭腔处理（切到配对面），否则按开口腔处理（切到顶面）。壁厚由 2D 轮廓差
+    自然形成（等壁厚）。返回 (shape, info) 或 (None, None)。
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+
+    try:
+        if vol is None or vol <= 0:
+            return None, None
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = np.eye(3)[int(np.argmax(np.abs(axis)))]  # 正规化，保证分桶稳定
+        nrm = _face_normals(mesh.faces, mesh.vertices)
+        hz = np.abs(nrm @ axis) > 0.9
+        fsel = np.where(hz)[0]
+        if len(fsel) < 8:
+            return None, None
+        v = mesh.vertices
+        zz = (v[mesh.faces[fsel]].mean(axis=1)) @ axis
+        aff = mesh.area_faces[fsel]
+        z_bot, z_top = float(zz.min()), float(zz.max())
+        ptp = z_top - z_bot
+        if ptp <= 1e-9:
+            return None, None
+        tol = 0.02 * ptp
+        bucket = np.round(zz / tol).astype(int)
+        keys = sorted(set(bucket.tolist()))
+        ga = {k: 0.0 for k in keys}
+        for k, a in zip(bucket.tolist(), aff.tolist()):
+            ga[k] += a
+        # 合并相邻桶（间隔 ≤2 桶）为一个水平面组
+        groups = []
+        cur = []
+        for k in keys:
+            if cur and k - cur[-1] > 2:
+                groups.append(cur)
+                cur = []
+            cur.append(k)
+        if cur:
+            groups.append(cur)
+        cands = []
+        for ks in groups:
+            msk = np.isin(bucket, ks)
+            a = float(aff[msk].sum())
+            if a <= 1e-9:
+                continue
+            zc = float((zz[msk] * aff[msk]).sum() / a)
+            cands.append({"msk": msk, "area": a, "z": zc})
+        if len(cands) < 2:
+            return None, None
+        cands.sort(key=lambda c: -c["area"])
+        out_grp = cands[0]
+        a_out = out_grp["area"]
+        # 内腔候选：结构内部、面积 25%~92% 外轮廓
+        inner = [c for c in cands[1:]
+                 if 0.25 * a_out <= c["area"] <= 0.92 * a_out
+                 and c["z"] > z_bot + 0.08 * ptp
+                 and c["z"] < z_top - 0.08 * ptp]
+        if not inner:
+            return None, None
+        cav = max(inner, key=lambda c: c["area"])
+        pair = None
+        for c in inner:
+            if c is cav:
+                continue
+            if (c["z"] > cav["z"] + 0.08 * ptp
+                    and abs(c["area"] - cav["area"]) / cav["area"] < 0.35):
+                if pair is None or c["area"] > pair["area"]:
+                    pair = c
+        z_cav_lo = cav["z"] - 0.5 * tol
+        z_cav_hi = (pair["z"] + 0.5 * tol) if pair is not None else z_top
+
+        # 2D 基与正规化 axis 自洽（不复用外部 basis，避免投影斜切）
+        u = np.cross(axis, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(u) < 1e-9:
+            u = np.cross(axis, np.array([0.0, 1.0, 0.0]))
+        u /= np.linalg.norm(u)
+        basis = np.array([u, np.cross(axis, u)])
+
+        def _blocks(msk):
+            polys = [sg.Polygon(t @ basis.T) for t in mesh.triangles[fsel[msk]]]
+            merged = unary_union(polys)
+            bl = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+            return [b for b in bl if b.area > 1.0]
+
+        out_blocks = sorted(_blocks(out_grp["msk"]), key=lambda b: -b.area)
+        cav_blocks = sorted(_blocks(cav["msk"]), key=lambda b: -b.area)
+        if not out_blocks or not cav_blocks:
+            return None, None
+        if out_blocks[0].area < 0.85 * a_out:
+            return None, None  # 外主面被拆散，轮廓不可靠
+
+        shell = _prism_poly(out_blocks[0], basis, axis * z_bot, axis * ptp)
+        if shell is None or shell.IsNull():
+            return None, None
+        for b in cav_blocks:
+            if b.area < 0.02 * a_out:
+                continue
+            cutter = _prism_poly(b, basis, axis * z_cav_lo,
+                                 axis * (z_cav_hi - z_cav_lo))
+            if cutter is None or cutter.IsNull():
+                return None, None
+            try:
+                shell = BRepAlgoAPI_Cut(shell, cutter).Shape()
+            except Exception:
+                return None, None
+            if shell is None or shell.IsNull():
+                return None, None
+        if not BRepCheck_Analyzer(shell).IsValid():
+            return None, None
+        vs = _volume(shell)
+        if vs is None or vs <= 0:
+            return None, None
+        err = abs(float(vs) / vol - 1.0)
+        if err > max_err:
+            return None, None
+        if pair is not None:
+            wall = min(abs(pair["z"] - cav["z"]), ptp)
+        else:
+            wall = min(cav["z"] - z_bot, z_top - cav["z"])
+        # 等壁厚更可靠的度量是内外轮廓的 2D 间距（封闭腔的配对间距只是腔高）
+        try:
+            w2d = float(cav_blocks[0].exterior.distance(out_blocks[0].exterior))
+        except Exception:
+            w2d = 0.0
+        if w2d > 1e-6:
+            wall = w2d
+        info = {
+            "outer_pts": int(len(out_blocks[0].exterior.coords)),
+            "hole_count": int(len(out_blocks[0].interiors)),
+            "thickness": float(ptp),
+            "area": float(a_out),
+            "counterbores": 0,
+            "circles": 0,
+            "obrounds": 0,
+            "edge_round": None,
+            "bosses": 0,
+            "shell": True,
+            "wall": float(max(0.0, wall)),
+            "err": float(vs / vol - 1.0),
+        }
+        return shell, info
+    except Exception:
+        return None, None
+
+
 def _solid_gap_ratio(mesh, axis, vol):
     """空腔/镂空判定：沿厚度轴求「最大水平主面面积 × 主面全跨距」/ 实际体积。
 
@@ -1586,8 +1826,12 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                 result.shapes.append((shape, True))
                 result.solid_count = 1
                 result.primitives = int(info["outer_pts"]) + int(info["hole_count"])
-                result.param_type = "plate"
-                if info.get("edge_round"):
+                result.param_type = "shell" if info.get("shell") else "plate"
+                if info.get("shell"):
+                    note = "识别为等壁厚壳体（外轮廓 {} 点 + {} 孔，壁厚 {:.2f}，体积误差 {:+.1f}% 的等壁厚近似）".format(
+                        info["outer_pts"], info["hole_count"],
+                        info.get("wall", 0.0), float(info.get("err", 0.0)) * 100.0)
+                elif info.get("edge_round"):
                     kind, rr = info["edge_round"]
                     note = "识别为带孔薄板 + 边缘{}R{:.2f}（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
                         "圆弧倒边" if kind == "fillet" else "倒角",

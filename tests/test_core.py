@@ -582,6 +582,61 @@ def test_plate_boss_no_false_positive():
         "普通板不应识别出凸台，实际 {}".format(info.get("bosses", 0)))
 
 
+def _shell_mesh(cavity_z0, cavity_h):
+    """40×30×12 外盒挖内腔 36×26×cavity_h（z 从 cavity_z0 起），返回网格。"""
+    from OCP.gp import gp_Pnt
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh
+
+    o = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40, 30, 12).Shape()
+    i = BRepPrimAPI_MakeBox(gp_Pnt(2, 2, cavity_z0), 36, 26, cavity_h).Shape()
+    c = BRepAlgoAPI_Cut(o, i).Shape()
+    mesh, _ = prepare_mesh(shape_to_mesh(c))
+    return mesh
+
+
+def test_shell_closed_recovered():
+    """封闭薄壁盒（内腔 2~10，壁厚 2）：重建为等壁厚壳体，体积误差 <=12%。"""
+    from stl_tool.parametric import detect_plate, _volume
+
+    mesh = _shell_mesh(2.0, 8.0)
+    shape, info = detect_plate(mesh)
+    assert shape is not None, "封闭薄壁盒应重建为壳体，实际 None"
+    assert info.get("shell") is True, "应走等壁厚壳体重建，实际 {}".format(info)
+    vol = float(_volume(shape))
+    err = abs(vol / float(mesh.volume) - 1.0)
+    assert err <= 0.12, "壳体重建体积误差应 <=12%，实际 {:.2f}%".format(err * 100)
+    assert 1.5 <= info["wall"] <= 2.5, (
+        "内外轮廓壁厚应约 2.0，实际 {:.2f}".format(info["wall"]))
+
+
+def test_shell_open_recovered():
+    """开口薄壁盒（内腔切到顶面，壁厚 2）：同样重建为等壁厚壳体。"""
+    from stl_tool.parametric import detect_plate, _volume
+
+    mesh = _shell_mesh(2.0, 10.0)
+    shape, info = detect_plate(mesh)
+    assert shape is not None, "开口薄壁盒应重建为壳体，实际 None"
+    assert info.get("shell") is True, "应走等壁厚壳体重建，实际 {}".format(info)
+    vol = float(_volume(shape))
+    err = abs(vol / float(mesh.volume) - 1.0)
+    assert err <= 0.12, "壳体重建体积误差应 <=12%，实际 {:.2f}%".format(err * 100)
+
+
+def test_shell_not_false_positive_on_thick_block():
+    """实心厚块：不得被壳体通道误判（没有内腔主面）。"""
+    import trimesh
+    from stl_tool.pipeline import prepare_mesh
+    from stl_tool.parametric import _detect_shell, _find_thickness_axis, _volume
+
+    mesh = trimesh.creation.box(extents=(30, 20, 10))
+    mesh, _ = prepare_mesh(mesh)
+    axis = _find_thickness_axis(mesh)
+    shape, info = _detect_shell(mesh, axis, float(mesh.volume))
+    assert shape is None, "实心块不应被识别为壳体"
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")
