@@ -1717,6 +1717,180 @@ def _detect_shell(mesh, axis, vol, max_err=0.12):
         return None, None
 
 
+def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.30, max_layers=40,
+                   min_group_frac=0.01):
+    """2.5D 分层截面重建：多腔 / 阶梯壁 / 多层薄壁裙边件。
+
+    与 `_detect_shell`（单一外壳 + 单一内腔的两棱柱近似）不同，这里不做内腔
+    配对假设：沿厚度轴把水平面按细粒度分桶得到**分层边界**，在相邻边界的中点
+    取网格截面（外轮廓 + 孔，可多块），逐层挤出棱柱后 Fuse。每层截面即该高度
+    区间的真实轮廓，因此多腔、阶梯壁、逐级收窄的薄壁底裙都能直接还原。
+
+    仅当同时满足以下条件才返回 (shape, info)，否则 (None, None) 交由调用方维持
+    原路径（零回归）：
+      - 层数 ≤ max_layers（避免过度碎片化）；
+      - 斜面面积占比 ≤ slope_max（曲面/斜坡件分层会切出明显台阶，不采纳）；
+      - Fuse 后实体 BRepCheck valid 且体积误差 ≤ max_err。
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.BRepCheck import BRepCheck_Analyzer
+
+    try:
+        if vol is None or vol <= 0:
+            return None, None
+        axis = np.asarray(axis, dtype=np.float64)
+        axis = np.eye(3)[int(np.argmax(np.abs(axis)))]  # 正规化，保证分桶稳定
+        nrm = _face_normals(mesh.faces, mesh.vertices)
+        an = np.abs(nrm @ axis)
+        fsel = np.where(an > 0.9)[0]
+        if len(fsel) < 8:
+            return None, None
+        v = mesh.vertices
+        zz = (v[mesh.faces[fsel]].mean(axis=1)) @ axis
+        aff = mesh.area_faces[fsel]
+        z_bot, z_top = float(zz.min()), float(zz.max())
+        ptp = z_top - z_bot
+        if ptp <= 1e-9:
+            return None, None
+        # 分层边界用细粒度分桶（0.2% 跨距）：真实水平面共面、噪声极小，2% 桶
+        # 会把相邻薄壁层（0.15~0.3mm）并成一层而丢掉阶梯。
+        tol = 0.002 * ptp
+        bucket = np.round(zz / tol).astype(int)
+        keys = sorted(set(bucket.tolist()))
+        ga = {}
+        for k, a in zip(bucket.tolist(), aff.tolist()):
+            ga[k] = ga.get(k, 0.0) + a
+        groups, cur = [], []
+        for k in keys:
+            if cur and k - cur[-1] > 1:
+                groups.append(cur)
+                cur = []
+            cur.append(k)
+        if cur:
+            groups.append(cur)
+        levels = []
+        for ks in groups:
+            msk = np.isin(bucket, ks)
+            a = float(aff[msk].sum())
+            if a <= 1e-9:
+                continue
+            zc = float((zz[msk] * aff[msk]).sum() / a)
+            levels.append((zc, a))
+        levels.sort()
+        if len(levels) < 2:
+            return None, None
+        # 丢弃斜近水平面（|n·axis| 刚过 0.9）产生的小面积伪层
+        amax = max(a for _, a in levels)
+        keep = max(1.0, min_group_frac * amax)
+        zs = [z for z, a in levels if a >= keep]
+        if len(zs) < 2 or len(zs) - 1 > max_layers:
+            return None, None
+        tot = float(mesh.area_faces.sum())
+        if tot <= 0:
+            return None, None
+        slope = float(mesh.area_faces[(an > 0.15) & (an < 0.9)].sum() / tot)
+        if slope > slope_max:
+            return None, None
+
+        solids = []
+        n_prism = 0
+        outer_pts = 0
+        hole_count = 0
+        for i in range(len(zs) - 1):
+            zlo, zhi = zs[i], zs[i + 1]
+            h = zhi - zlo
+            if h <= 1e-6:
+                continue
+            mid = 0.5 * (zlo + zhi)
+            sec = mesh.section(plane_origin=axis * mid, plane_normal=axis)
+            if sec is None:
+                return None, None
+            try:
+                to2d = getattr(sec, "to_2D", None)
+                p2, tf = to2d() if to2d is not None else sec.to_planar()
+            except Exception:
+                return None, None
+            polys = [p for p in p2.polygons_full if p.area > 0.5]
+            if not polys:
+                return None, None
+            tf = np.asarray(tf, dtype=np.float64)
+            # to_2D/to_planar 的原点落在截面中面上，挤出必须从层底开始
+            origin = tf[:3, 3] - axis * (mid - zlo)
+            basis = tf[:3, :2].T
+            for poly in polys:
+                pls = [poly]
+                if not poly.is_valid:
+                    fixed = poly.buffer(0)
+                    pls = (list(fixed.geoms) if fixed.geom_type == "MultiPolygon"
+                           else [fixed])
+                for pl in pls:
+                    if pl.area <= 0.5:
+                        continue
+                    s = _prism_poly(pl, basis, origin, axis * h)
+                    if s is None or s.IsNull():
+                        return None, None
+                    solids.append(s)
+                    n_prism += 1
+                outer_pts = max(outer_pts, len(poly.exterior.coords))
+                hole_count = max(hole_count, len(poly.interiors))
+        if not solids:
+            return None, None
+
+        fused = solids[0]
+        for s in solids[1:]:
+            fu = BRepAlgoAPI_Fuse(fused, s)
+            if not fu.IsDone():
+                return None, None
+            fused = fu.Shape()
+            if fused is None or fused.IsNull():
+                return None, None
+        if not BRepCheck_Analyzer(fused).IsValid():
+            return None, None
+        vs = _volume(fused)
+        if vs is None or vs <= 0:
+            return None, None
+        err = float(vs) / vol - 1.0
+        if abs(err) > max_err:
+            return None, None
+        info = {
+            "outer_pts": int(outer_pts),
+            "hole_count": int(hole_count),
+            "thickness": float(ptp),
+            "area": float("nan"),
+            "counterbores": 0,
+            "circles": 0,
+            "obrounds": 0,
+            "edge_round": None,
+            "bosses": 0,
+            "shell": False,
+            "layers": int(len(zs) - 1),
+            "prisms": int(n_prism),
+            "slope": float(slope),
+            "err": float(err),
+        }
+        return fused, info
+    except Exception:
+        return None, None
+
+
+def _prefer_layers(mesh, shape, err_cur, max_err=0.07, gain=0.015):
+    """当前结果体积误差偏大时，若分层重建显著更准则改用分层结果（否则 None）。"""
+    if shape is None or err_cur is None or err_cur <= 0.03:
+        return None, None
+    try:
+        axis = _find_thickness_axis(mesh)
+        vol = _volume_approx(mesh)
+        lay, linfo = _detect_layers(mesh, axis, vol, max_err=max_err)
+        if lay is None or linfo is None:
+            return None, None
+        e = abs(float(linfo["err"]))
+        if e < err_cur - gain:
+            return lay, linfo
+    except Exception:
+        pass
+    return None, None
+
+
 def _solid_gap_ratio(mesh, axis, vol):
     """空腔/镂空判定：沿厚度轴求「最大水平主面面积 × 主面全跨距」/ 实际体积。
 
@@ -1840,12 +2014,43 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                     note = "识别为带孔薄板（外轮廓 {} 点 + {} 孔，厚 {:.2f}）".format(
                         info["outer_pts"], info["hole_count"], info["thickness"])
             else:
-                if info is not None and info.get("reject_reason"):
-                    result.message = "{}，请走逐三角或 analytic 模式。".format(
-                        info["reject_reason"])
+                # M14：不是单一板件时先试 2.5D 分层截面重建（多腔/阶梯壁/薄壁
+                # 裙边件），成功则给出可编辑近似实体；仍失败才诚实拒绝。
+                lay, linfo = None, None
+                try:
+                    lay, linfo = _detect_layers(mesh, _find_thickness_axis(mesh),
+                                                _volume_approx(mesh))
+                except Exception:
+                    lay, linfo = None, None
+                if lay is not None:
+                    result.shapes.append((lay, True))
+                    result.solid_count = 1
+                    result.primitives = int(linfo["prisms"])
+                    result.param_type = "layers"
+                    note = ("识别为分层截面近似（{} 层，体积误差 {:+.1f}% 的 2.5D 近似）"
+                            .format(linfo["layers"], float(linfo["err"]) * 100.0))
                 else:
-                    result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
-                return result
+                    if info is not None and info.get("reject_reason"):
+                        result.message = "{}，请走逐三角或 analytic 模式。".format(
+                            info["reject_reason"])
+                    else:
+                        result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
+                    return result
+
+    # M14：已命中的结果体积误差偏大时（如 plateau 板漏掉阶梯壁），若分层截面
+    # 重建显著更准则改用分层结果；否则保持原结果（零回归）。
+    if result.shapes:
+        vol = _volume_approx(mesh)
+        cur = _volume(result.shapes[0][0])
+        err_cur = abs(float(cur) / vol - 1.0) if (vol and cur is not None) else None
+        lay, linfo = _prefer_layers(mesh, result.shapes[0][0], err_cur)
+        if lay is not None:
+            result.shapes = [(lay, True)]
+            result.solid_count = 1
+            result.primitives = int(linfo["prisms"])
+            result.param_type = "layers"
+            note = ("识别为分层截面近似（{} 层，体积误差 {:+.1f}% 的 2.5D 近似）"
+                    .format(linfo["layers"], float(linfo["err"]) * 100.0))
 
     for s, _ in result.shapes:
         if not _valid(s):

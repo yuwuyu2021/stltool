@@ -637,6 +637,61 @@ def test_shell_not_false_positive_on_thick_block():
     assert shape is None, "实心块不应被识别为壳体"
 
 
+def _multi_cavity_mesh(cuts, size=(40, 30, 12)):
+    """40×30×12 外盒按 cuts 列表（x, y, z, dx, dy, dz）挖腔，返回网格。"""
+    from OCP.gp import gp_Pnt
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from stl_tool.pipeline import shape_to_mesh, prepare_mesh
+
+    o = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), *size).Shape()
+    for (x, y, z, dx, dy, dz) in cuts:
+        c = BRepPrimAPI_MakeBox(gp_Pnt(x, y, z), dx, dy, dz).Shape()
+        o = BRepAlgoAPI_Cut(o, c).Shape()
+    mesh, _ = prepare_mesh(shape_to_mesh(o))
+    return mesh
+
+
+def test_layers_multicavity_recovered():
+    """双腔（不同深度）：M13 单一内腔假设失效，分层截面重建应还原。"""
+    from stl_tool.parametric import (_detect_layers, _find_thickness_axis,
+                                     _volume, _volume_approx, convert_parametric)
+
+    mesh = _multi_cavity_mesh([(2, 2, 2, 16, 26, 4), (22, 2, 2, 16, 26, 8)])
+    lay, info = _detect_layers(mesh, _find_thickness_axis(mesh), _volume_approx(mesh))
+    assert lay is not None, "双腔盒应被分层截面重建"
+    err = abs(float(_volume(lay)) / float(mesh.volume) - 1.0)
+    assert err <= 0.06, "双腔盒体积误差应 <=6%，实际 {:.2f}%".format(err * 100)
+    assert info["layers"] >= 3, "双腔不同深应有 >=3 层，实际 {}".format(info["layers"])
+    r = convert_parametric(mesh)
+    assert getattr(r, "param_type", "") == "layers", (
+        "双腔盒应走分层重建，实际 {}".format(getattr(r, "param_type", "")))
+
+
+def test_layers_stepped_wall_recovered():
+    """阶梯壁（下宽上窄、开口朝上）：分层重建应还原，误差 <=6%。"""
+    from stl_tool.parametric import (_detect_layers, _find_thickness_axis,
+                                     _volume, _volume_approx)
+
+    mesh = _multi_cavity_mesh([(2, 2, 2, 36, 26, 4), (7, 7, 6, 26, 16, 6)])
+    lay, info = _detect_layers(mesh, _find_thickness_axis(mesh), _volume_approx(mesh))
+    assert lay is not None, "阶梯壁盒应被分层截面重建"
+    err = abs(float(_volume(lay)) / float(mesh.volume) - 1.0)
+    assert err <= 0.06, "阶梯壁体积误差应 <=6%，实际 {:.2f}%".format(err * 100)
+
+
+def test_layers_not_false_positive_on_curved():
+    """曲面件（斜面占比过高）：分层重建必须拒绝，避免切出明显台阶。"""
+    import trimesh
+    from stl_tool.pipeline import prepare_mesh
+    from stl_tool.parametric import (_detect_layers, _find_thickness_axis,
+                                     _volume_approx)
+
+    mesh, _ = prepare_mesh(trimesh.creation.icosphere(subdivisions=3, radius=10.0))
+    lay, info = _detect_layers(mesh, _find_thickness_axis(mesh), _volume_approx(mesh))
+    assert lay is None, "球面件不应被分层截面重建（斜面占比过高）"
+
+
 def test_param_fallback_reports_reason():
     """参数化未命中自动回退时，prep_notes 必须带出具体原因（M3 失败诊断）。"""
     import trimesh
