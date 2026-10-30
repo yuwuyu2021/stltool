@@ -1003,6 +1003,18 @@ def _prism_poly(poly2d, basis, origin, height_vec, rdp_eps=0.1,
         pts = np.asarray(list(ring.coords), dtype=np.float64)
         if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
             pts = pts[:-1]
+        # 去掉重合/极近点：截面恰好切在退化位置时环上会带 1e-5 量级的零长边，
+        # MakeEdge/MakeWire 会直接失败（Z2支架 mid=132.554 层即此因）。
+        if len(pts) > 2:
+            ext = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+            eps_dup = max(1e-9, ext * 1e-6)
+            keep = [pts[0]]
+            for p in pts[1:]:
+                if np.linalg.norm(p - keep[-1]) > eps_dup:
+                    keep.append(p)
+            if len(keep) > 1 and np.linalg.norm(keep[0] - keep[-1]) <= eps_dup:
+                keep.pop()
+            pts = np.asarray(keep, dtype=np.float64)
         if rdp_eps and len(pts) > 8:
             pts = _loop_rdp(pts, rdp_eps)
         if len(pts) < 3:
@@ -1717,7 +1729,67 @@ def _detect_shell(mesh, axis, vol, max_err=0.12):
         return None, None
 
 
-def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.30, max_layers=40,
+def _section_polys(mesh, axis, z, min_area=0.5):
+    """在高度 z 取网格截面，返回 (polys, origin, basis)；origin 落在该截面中面。"""
+    sec = mesh.section(plane_origin=axis * z, plane_normal=axis)
+    if sec is None:
+        return None
+    try:
+        to2d = getattr(sec, "to_2D", None)
+        p2, tf = to2d() if to2d is not None else sec.to_planar()
+    except Exception:
+        return None
+    polys = [p for p in p2.polygons_full if p.area > min_area]
+    if not polys:
+        return None
+    tf = np.asarray(tf, dtype=np.float64)
+    return polys, tf[:3, 3], tf[:3, :2].T
+
+
+def _layer_solids(mesh, axis, zlo, zhi, seed=None):
+    """挤出 [zlo, zhi] 层的截面棱柱；某一位置的截面退化时在层内换高度重试。
+
+    层内是等截面区间，理论上任取高度都行，因此某处截面切在退化位置（零长边、
+    自交环）导致 MakeWire 失败时，换 0.25/0.75/0.1/0.9 位置重取即可绕过。
+    返回 (solids, polys) 或 (None, None)。
+    """
+    h = zhi - zlo
+    fracs = (0.5, 0.25, 0.75, 0.1, 0.9)
+    for k, f in enumerate(fracs):
+        if k == 0 and seed is not None:
+            polys, org, basis = seed
+            zc = 0.5 * (zlo + zhi)
+        else:
+            zc = zlo + f * h
+            got = _section_polys(mesh, axis, zc)
+            if got is None:
+                continue
+            polys, org, basis = got
+        origin = org - axis * (zc - zlo)
+        out = []
+        ok = True
+        for poly in polys:
+            pls = [poly]
+            if not poly.is_valid:
+                fixed = poly.buffer(0)
+                pls = (list(fixed.geoms) if fixed.geom_type == "MultiPolygon"
+                       else [fixed])
+            for pl in pls:
+                if pl.area <= 0.5:
+                    continue
+                s = _prism_poly(pl, basis, origin, axis * h)
+                if s is None or s.IsNull():
+                    ok = False
+                    break
+                out.append(s)
+            if not ok:
+                break
+        if ok and out:
+            return out, polys
+    return None, None
+
+
+def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.45, max_layers=60,
                    min_group_frac=0.01):
     """2.5D 分层截面重建：多腔 / 阶梯壁 / 多层薄壁裙边件。
 
@@ -1730,7 +1802,10 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.30, max_layers=40,
     原路径（零回归）：
       - 层数 ≤ max_layers（避免过度碎片化）；
       - 斜面面积占比 ≤ slope_max（曲面/斜坡件分层会切出明显台阶，不采纳）；
+      - 逐层截面体积估计与网格体积相差 ≤ max_err+2%（廉价前置闸门，先把
+        明显不是 2.5D 的件按秒级成本拒掉）；
       - Fuse 后实体 BRepCheck valid 且体积误差 ≤ max_err。
+    层内截面切在退化位置（MakeWire 失败）时，换层内其他高度重取再试。
     """
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
     from OCP.BRepCheck import BRepCheck_Analyzer
@@ -1784,55 +1859,61 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.30, max_layers=40,
         keep = max(1.0, min_group_frac * amax)
         zs = [z for z, a in levels if a >= keep]
         if len(zs) < 2 or len(zs) - 1 > max_layers:
-            return None, None
+            return None, {
+                "reject_reason": "水平分层过多（{} 层，上限 {}）。".format(
+                    len(zs) - 1, max_layers),
+                "layers": int(max(0, len(zs) - 1)),
+            }
         tot = float(mesh.area_faces.sum())
         if tot <= 0:
             return None, None
         slope = float(mesh.area_faces[(an > 0.15) & (an < 0.9)].sum() / tot)
         if slope > slope_max:
-            return None, None
+            return None, {
+                "reject_reason": "斜面面积占比 {:.0f}% 超过 {:.0f}%（曲面/斜坡件分层会切出台阶）".format(
+                    slope * 100.0, slope_max * 100.0),
+                "slope": float(slope),
+            }
 
         solids = []
         n_prism = 0
         outer_pts = 0
         hole_count = 0
+        # 1) 廉价前置闸门：只取截面（不挤不 Fuse）估算逐层体积。真实非 2.5D
+        # 结构（斜撑、风道曲面）在截面面积上就明显缺料，这一遍能把它们按
+        # 0.2~2s 成本拒掉，而不是白跑上百秒的逐层挤出与布尔运算。
+        layers = []
+        est = 0.0
         for i in range(len(zs) - 1):
             zlo, zhi = zs[i], zs[i + 1]
             h = zhi - zlo
             if h <= 1e-6:
                 continue
-            mid = 0.5 * (zlo + zhi)
-            sec = mesh.section(plane_origin=axis * mid, plane_normal=axis)
-            if sec is None:
+            got = _section_polys(mesh, axis, 0.5 * (zlo + zhi))
+            if got is None:
                 return None, None
-            try:
-                to2d = getattr(sec, "to_2D", None)
-                p2, tf = to2d() if to2d is not None else sec.to_planar()
-            except Exception:
+            polys, org, basis = got
+            est += h * float(sum(p.area for p in polys))
+            layers.append((zlo, zhi, (polys, org, basis)))
+        if not layers or abs(est / vol - 1.0) > max_err + 0.02:
+            # 逐层截面面积就明显对不上 → 不是 2.5D 结构（斜撑、风道曲面等），
+            # 给出量化的拒绝原因，便于上层日志告诉用户"为什么没用分层"。
+            return None, {
+                "reject_reason": "逐层截面体积比网格{} {:.0f}%（结构不是 2.5D，分层会明显失真）".format(
+                    "多" if est > vol else "少", abs(est / vol - 1.0) * 100.0)
+                if layers else "没有可用的水平分层",
+                "layers": int(len(layers)),
+                "slope": float(slope),
+            }
+        # 2) 逐层挤出（截面退化时层内换高度重试）+ Fuse
+        for (zlo, zhi, seed) in layers:
+            got_solids, polys = _layer_solids(mesh, axis, zlo, zhi, seed=seed)
+            if got_solids is None:
                 return None, None
-            polys = [p for p in p2.polygons_full if p.area > 0.5]
-            if not polys:
-                return None, None
-            tf = np.asarray(tf, dtype=np.float64)
-            # to_2D/to_planar 的原点落在截面中面上，挤出必须从层底开始
-            origin = tf[:3, 3] - axis * (mid - zlo)
-            basis = tf[:3, :2].T
-            for poly in polys:
-                pls = [poly]
-                if not poly.is_valid:
-                    fixed = poly.buffer(0)
-                    pls = (list(fixed.geoms) if fixed.geom_type == "MultiPolygon"
-                           else [fixed])
-                for pl in pls:
-                    if pl.area <= 0.5:
-                        continue
-                    s = _prism_poly(pl, basis, origin, axis * h)
-                    if s is None or s.IsNull():
-                        return None, None
-                    solids.append(s)
-                    n_prism += 1
-                outer_pts = max(outer_pts, len(poly.exterior.coords))
-                hole_count = max(hole_count, len(poly.interiors))
+            solids.extend(got_solids)
+            n_prism += len(got_solids)
+            outer_pts = max(outer_pts, max(len(p.exterior.coords) for p in polys))
+            hole_count = max(hole_count, max(len(p.interiors) for p in polys))
         if not solids:
             return None, None
 
@@ -1845,13 +1926,18 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.30, max_layers=40,
             if fused is None or fused.IsNull():
                 return None, None
         if not BRepCheck_Analyzer(fused).IsValid():
-            return None, None
+            return None, {"reject_reason": "分层棱柱布尔结果无效（BRepCheck 未通过）"}
         vs = _volume(fused)
         if vs is None or vs <= 0:
             return None, None
         err = float(vs) / vol - 1.0
         if abs(err) > max_err:
-            return None, None
+            return None, {
+                "reject_reason": "分层重建体积误差 {:+.1f}% 超过 {:.0f}%".format(
+                    err * 100.0, max_err * 100.0),
+                "layers": int(len(layers)),
+                "err": float(err),
+            }
         info = {
             "outer_pts": int(outer_pts),
             "hole_count": int(hole_count),
@@ -2030,9 +2116,14 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                     note = ("识别为分层截面近似（{} 层，体积误差 {:+.1f}% 的 2.5D 近似）"
                             .format(linfo["layers"], float(linfo["err"]) * 100.0))
                 else:
+                    reasons = []
                     if info is not None and info.get("reject_reason"):
+                        reasons.append(str(info["reject_reason"]))
+                    if linfo is not None and linfo.get("reject_reason"):
+                        reasons.append("分层近似不适用：{}".format(linfo["reject_reason"]))
+                    if reasons:
                         result.message = "{}，请走逐三角或 analytic 模式。".format(
-                            info["reject_reason"])
+                            "；".join(reasons))
                     else:
                         result.message = "无法整体参数化（非长方体/圆柱/圆锥/球/回转体/带孔薄板），请走逐三角或 analytic 模式。"
                     return result

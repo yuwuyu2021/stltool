@@ -690,6 +690,48 @@ def test_layers_not_false_positive_on_curved():
     mesh, _ = prepare_mesh(trimesh.creation.icosphere(subdivisions=3, radius=10.0))
     lay, info = _detect_layers(mesh, _find_thickness_axis(mesh), _volume_approx(mesh))
     assert lay is None, "球面件不应被分层截面重建（斜面占比过高）"
+    assert (info or {}).get("reject_reason"), (
+        "分层拒绝时应带出原因（便于日志说明），实际 {}".format(info))
+
+
+def _trapezoid_prism_mesh():
+    """梯形棱柱（底 40、顶 10、高 8，沿 Y 挤出 30）：两侧 ~28° 斜面，斜面占比 ~35%。"""
+    import numpy as np
+    import trimesh
+    import shapely.geometry as sg
+    from stl_tool.pipeline import prepare_mesh
+
+    poly = sg.Polygon([(-20, 0), (20, 0), (5, 8), (-5, 8)])
+    m = trimesh.creation.extrude_polygon(poly, 30)
+    # 挤出方向 Z → 转到 Y，让厚度轴仍是 Z、斜面进 (0.15,0.9) 的斜面区间
+    m.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+    m = m.subdivide().subdivide()  # 细分：水平面片数需 >= 8 才进入分层判定
+    m, _ = prepare_mesh(m)
+    return m
+
+
+def test_layers_slanted_prism_relaxed_slope():
+    """斜面占比 30%~45% 的 2.5D 斜坡件：放宽阈值后应命中且体积准确。
+
+    对应真实件 Z0支架/Z2支架（30.5%）、灯卡（37.4%）、散热块稳定器（31.5%）：
+    旧阈值 30% 一刀切拒绝，实测这些件分层后体积误差 0.02%~4%，表面偏差与
+    既有已接受件同档。
+    """
+    from stl_tool.parametric import (_detect_layers, _find_thickness_axis,
+                                     _volume, _volume_approx, convert_parametric)
+
+    mesh = _trapezoid_prism_mesh()
+    vol = _volume_approx(mesh)
+    axis = _find_thickness_axis(mesh)
+    strict, sinfo = _detect_layers(mesh, axis, vol, slope_max=0.30)
+    assert strict is None, "斜面占比 >30% 时旧阈值应拒绝"
+    assert (sinfo or {}).get("reject_reason"), sinfo
+    lay, info = _detect_layers(mesh, axis, vol)
+    assert lay is not None, "放宽到 45% 后 2.5D 斜坡件应命中，实际 {}".format(info)
+    err = abs(float(_volume(lay)) / vol - 1.0)
+    assert err <= 0.06, "斜坡件体积误差应 <=6%，实际 {:.2f}%".format(err * 100)
+    r = convert_parametric(mesh)
+    assert getattr(r, "param_type", "") == "layers", getattr(r, "param_type", "")
 
 
 def test_param_fallback_reports_reason():
