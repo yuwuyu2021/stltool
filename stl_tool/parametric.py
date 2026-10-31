@@ -80,6 +80,23 @@ def _valid(shape):
         return False
 
 
+def _fidelity_ok(mesh, shape):
+    """实体与原网格的表面偏差是否可接受（拦整体错位/形状不符的拟合）。
+
+    体积误差 + BRepCheck 都通过的实体仍可能整体平移或轴选错——体积对但
+    位置错。这里用双向最近点偏差做最后一道闸门；度量本身失败时不阻塞
+    既有流程（避免环境问题导致整条路径不可用）。
+    """
+    try:
+        from .quality import surface_deviation, low_fidelity
+        fid = surface_deviation(mesh, shape)
+    except Exception:
+        return True
+    if not fid:
+        return True
+    return not low_fidelity(fid)
+
+
 def _make_box_shape(model):
     """由主轴尺寸直接生成长方体实体。"""
     from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
@@ -94,7 +111,7 @@ def _make_box_shape(model):
 def _make_cylinder_shape(model):
     from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
     from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
-    c = model["axis_point"]
+    c = model["base_center"]
     ax = gp_Ax2(gp_Pnt(*c), gp_Dir(*model["axis"]))
     return BRepPrimAPI_MakeCylinder(ax,
                                     float(model["R"]), float(model["height"])).Shape()
@@ -153,8 +170,11 @@ def fit_box(verts, diag):
     d = dist_axis.min(axis=1)
     rms = float(np.sqrt(np.mean(d * d)))
     # 额外护栏：纯盒体的面法向必须基本平行于主轴（3 组互为垂直）
+    # MakeBox 以“角点”为基准向 +u/+v/+w 拉伸，必须给投影最小角点，
+    # 用中心点会让整个实体平移半个尺寸（M16 保真度体检暴露）。
+    corner = cent + axes @ lo
     return {"type": "box", "u": axes[:, 0], "v": axes[:, 1], "w": axes[:, 2],
-            "origin": cent, "Lx": Lx, "Ly": Ly, "Lz": Lz, "rms": rms}
+            "origin": corner, "Lx": Lx, "Ly": Ly, "Lz": Lz, "rms": rms}
 
 
 def _rev_axis_candidates(normals, verts, faces):
@@ -203,15 +223,22 @@ def _side_face_mask(normals, axis, cos_tol=0.2):
 
 
 def fit_cylinder_ax(verts, normals, faces, axis, axis_point):
-    """已知轴，用侧面积中值半径 + 轴向高度拟合圆柱（rms 为侧面径向偏差）。"""
+    """已知轴，用侧面积中值半径 + 轴向高度拟合圆柱（rms 为侧面径向偏差）。
+
+    h/rr 必须相对轴上的参考点 axis_point 度量：轴一般不过世界原点，
+    用原点投影会把半径和高度算错，实体跟着错位。
+    """
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
+    axis_point = np.asarray(axis_point, dtype=np.float64)
     pts = np.asarray(verts, dtype=np.float64)
-    h = pts @ axis
-    rr = np.linalg.norm(pts - h[:, None] * axis, axis=1)
+    rel = pts - axis_point
+    h = rel @ axis
+    rr = np.linalg.norm(rel - h[:, None] * axis, axis=1)
     fc = pts[np.asarray(faces, dtype=int)].mean(axis=1)
-    hf = fc @ axis
-    rrf = np.linalg.norm(fc - hf[:, None] * axis, axis=1)
+    relf = fc - axis_point
+    hf = relf @ axis
+    rrf = np.linalg.norm(relf - hf[:, None] * axis, axis=1)
     side = _side_face_mask(normals, axis)
     if side.sum() < 8:
         return None
@@ -225,7 +252,8 @@ def fit_cylinder_ax(verts, normals, faces, axis, axis_point):
         return None
     rms_side = float(np.sqrt(np.mean((side_rr - R) ** 2)))
     H = float(h.max() - h.min())
-    return {"type": "cylinder", "axis": axis, "axis_point": axis_point,
+    base_center = axis_point + float(h.min()) * axis
+    return {"type": "cylinder", "axis": axis, "base_center": base_center,
             "R": R, "height": H, "rms": rms_side}
 
 
@@ -233,10 +261,12 @@ def fit_cone_ax(verts, normals, faces, axis, axis_point):
     """已知轴，把圆锥拟合成 OCP MakeCone 需要的底/顶半径与高度。"""
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
+    axis_point = np.asarray(axis_point, dtype=np.float64)
     pts = np.asarray(verts, dtype=np.float64)
     fc = pts[np.asarray(faces, dtype=int)].mean(axis=1)
-    hf = fc @ axis
-    rrf = np.linalg.norm(fc - hf[:, None] * axis, axis=1)
+    relf = fc - axis_point
+    hf = relf @ axis
+    rrf = np.linalg.norm(relf - hf[:, None] * axis, axis=1)
     side = _side_face_mask(normals, axis, cos_tol=0.95)
     if side.sum() < 8:
         return None
@@ -249,10 +279,10 @@ def fit_cone_ax(verts, normals, faces, axis, axis_point):
         return None
     R_line = np.clip(hf * slope + offset, 0.0, None)
     rms = float(np.sqrt(np.mean((rrf - R_line) ** 2)))
-    apex = axis_point + (-offset / slope) * axis
-    base_center = axis_point + hmin * axis
     hmin = float(hf.min())
     hmax = float(hf.max())
+    apex = axis_point + (-offset / slope) * axis
+    base_center = axis_point + hmin * axis
     R_base = float(np.clip(hmin * slope + offset, 0.0, None))
     R_top = float(np.clip(hmax * slope + offset, 0.0, None))
     return {"type": "cone", "axis": axis, "apex": apex, "base_center": base_center,
@@ -326,6 +356,8 @@ def detect_primitive(mesh, tol_frac=0.004, max_rel_vol_err=0.10, progress_cb=Non
             rel = abs(sv - mesh_vol) / mesh_vol
             if rel > max_rel_vol_err:
                 continue
+        if not _fidelity_ok(mesh, sh):
+            continue
         best = (sh, m)
         break
     if progress_cb is not None:
@@ -353,24 +385,28 @@ def revolve_profile(verts, axis, axis_point, n_slices=180):
     """
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
+    axis_point = np.asarray(axis_point, dtype=np.float64)
     pts = np.asarray(verts, dtype=np.float64)
-    h = pts @ axis
-    rr = np.linalg.norm(pts - h[:, None] * axis, axis=1)
+    # 必须相对轴上的参考点度量：轴通常不过世界原点，
+    # 直接用 pts@axis 会把"到原点的轴向距离"当成轴向坐标，实体整体错位。
+    rel = pts - axis_point
+    h = rel @ axis
+    rr = np.linalg.norm(rel - h[:, None] * axis, axis=1)
     hmin, hmax = float(h.min()), float(h.max())
     if hmax - hmin < 1e-12:
         return None
 
-    # 按唯一轴向坐标分组；合并极近层（容差=对角线的 1e-5）
-    hq = np.round(h / (hmax - hmin) * int(n_slices)).astype(int)
-    lo = hq.min()
-    hq -= lo
+    # 相对轴向范围分桶（用 h 的绝对值分桶在 hmin<0 时会错层）
+    span = hmax - hmin
+    hq = np.clip(np.round((h - hmin) / span * int(n_slices)).astype(int),
+                 0, int(n_slices))
     nb = int(hq.max()) + 1
     rmax = np.full(nb, -1.0)
     np.maximum.at(rmax, hq, rr)
     good = rmax >= 0
-    hs = (np.arange(nb)[good] + lo).astype(float) / int(n_slices) * (hmax - hmin) + hmin
+    hs = np.arange(nb)[good].astype(float) / int(n_slices) * span + hmin
     rmax = rmax[good]
-    hs += (hmax - hmin) / int(n_slices) / 2.0  # 量化层中心
+    hs += span / int(n_slices) / 2.0  # 量化层中心
     hs = np.clip(hs, hmin, hmax)
     return hs, rmax, hmin, hmax
 
@@ -417,14 +453,20 @@ def detect_revolve(mesh, tol_frac=0.006, max_rel_vol_err=0.30, progress_cb=None)
         rad = np.cross(axis, o1)
         rad = rad / np.linalg.norm(rad)
 
-        # 轮廓点（3D，位于轴平面内）。端点 r≈0 时的闭合边正好沿轴，
-        # 无需再手动添加轴点，避免重复点产生零长边导致 wire 断裂。
+        # 轮廓点（3D，位于轴平面内）。母线只取外轮廓（rmax）；
+        # 端部半径不为 0 时必须补轴点把端面封成平面——否则"最后点→首点"
+        # 的闭合边会在实体内部切出一个锥面（小酒杯/带平顶的回转件实测体积少 30%）。
+        seg = [(float(hh), float(rr)) for hh, rr in zip(hs_k, rmax_k)]
+        if seg and seg[-1][1] > 1e-9 * diag:
+            seg.append((seg[-1][0], 0.0))
+        if seg and seg[0][1] > 1e-9 * diag:
+            seg.insert(0, (seg[0][0], 0.0))
         pts = []
-        for hh, rr in zip(hs_k, rmax_k):
-            if pts and np.linalg.norm(
-                    (axis_point + hh * axis + rr * rad) - pts[-1]) < 1e-12:
+        for hh, rr in seg:
+            p = axis_point + hh * axis + rr * rad
+            if pts and np.linalg.norm(p - pts[-1]) < 1e-12:
                 continue
-            pts.append(axis_point + hh * axis + rr * rad)
+            pts.append(p)
         if len(pts) < 3:
             continue
 
@@ -461,6 +503,10 @@ def detect_revolve(mesh, tol_frac=0.006, max_rel_vol_err=0.30, progress_cb=None)
             sv = _volume(solid)
             if sv is None or abs(sv - mesh_vol) / mesh_vol > max_rel_vol_err:
                 continue
+        # 体积对不代表形状对：非回转件也能凑出体积相近的回转体（实测 3 件
+        # 真实件就是这种假阳性，实体整体错位）。用表面偏差做最终验收。
+        if not _fidelity_ok(mesh, solid):
+            continue
 
         if progress_cb is not None:
             progress_cb(2, 2)
@@ -1182,7 +1228,8 @@ def detect_plate(mesh, tol_frac=0.01, min_flat_frac=0.25, progress_cb=None):
                 shell, sinfo = _detect_shell(mesh, axis, vol)
                 if shell is not None:
                     return shell, sinfo
-                return None, {"reject_reason":
+                return None, {"reject_code": "plate_cavity",
+                              "reject_reason":
                     "检测到内部空腔/镂空（第二主面或双层壁），薄板参数化不适用"}
         if round_ok is None and err0 > 0.25:
                 # 原计数中位被小面积高密度离散（合成件 shape_to_mesh 台面点
@@ -1860,6 +1907,7 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.45, max_layers=60,
         zs = [z for z, a in levels if a >= keep]
         if len(zs) < 2 or len(zs) - 1 > max_layers:
             return None, {
+                "reject_code": "layers_too_many",
                 "reject_reason": "水平分层过多（{} 层，上限 {}）。".format(
                     len(zs) - 1, max_layers),
                 "layers": int(max(0, len(zs) - 1)),
@@ -1870,6 +1918,7 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.45, max_layers=60,
         slope = float(mesh.area_faces[(an > 0.15) & (an < 0.9)].sum() / tot)
         if slope > slope_max:
             return None, {
+                "reject_code": "layers_slope",
                 "reject_reason": "斜面面积占比 {:.0f}% 超过 {:.0f}%（曲面/斜坡件分层会切出台阶）".format(
                     slope * 100.0, slope_max * 100.0),
                 "slope": float(slope),
@@ -1899,6 +1948,7 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.45, max_layers=60,
             # 逐层截面面积就明显对不上 → 不是 2.5D 结构（斜撑、风道曲面等），
             # 给出量化的拒绝原因，便于上层日志告诉用户"为什么没用分层"。
             return None, {
+                "reject_code": "layers_section_volume",
                 "reject_reason": "逐层截面体积比网格{} {:.0f}%（结构不是 2.5D，分层会明显失真）".format(
                     "多" if est > vol else "少", abs(est / vol - 1.0) * 100.0)
                 if layers else "没有可用的水平分层",
@@ -1926,13 +1976,15 @@ def _detect_layers(mesh, axis, vol, max_err=0.06, slope_max=0.45, max_layers=60,
             if fused is None or fused.IsNull():
                 return None, None
         if not BRepCheck_Analyzer(fused).IsValid():
-            return None, {"reject_reason": "分层棱柱布尔结果无效（BRepCheck 未通过）"}
+            return None, {"reject_code": "layers_boolean_invalid",
+                          "reject_reason": "分层棱柱布尔结果无效（BRepCheck 未通过）"}
         vs = _volume(fused)
         if vs is None or vs <= 0:
             return None, None
         err = float(vs) / vol - 1.0
         if abs(err) > max_err:
             return None, {
+                "reject_code": "layers_volume_err",
                 "reject_reason": "分层重建体积误差 {:+.1f}% 超过 {:.0f}%".format(
                     err * 100.0, max_err * 100.0),
                 "layers": int(len(layers)),
@@ -2117,10 +2169,16 @@ def convert_parametric(mesh, tolerance=1e-5, tol_frac=0.004, progress_cb=None):
                             .format(linfo["layers"], float(linfo["err"]) * 100.0))
                 else:
                     reasons = []
+                    codes = []
                     if info is not None and info.get("reject_reason"):
                         reasons.append(str(info["reject_reason"]))
+                        if info.get("reject_code"):
+                            codes.append(str(info["reject_code"]))
                     if linfo is not None and linfo.get("reject_reason"):
                         reasons.append("分层近似不适用：{}".format(linfo["reject_reason"]))
+                        if linfo.get("reject_code"):
+                            codes.append(str(linfo["reject_code"]))
+                    result.reject_code = "+".join(codes) if codes else "no_match"
                     if reasons:
                         result.message = "{}，请走逐三角或 analytic 模式。".format(
                             "；".join(reasons))

@@ -19,6 +19,8 @@ class ConvertOptions:
         self.parametric = False
         self.residual_patch_deg = 9.0
         self.simplify_large = True
+        # 表面保真度体检（双向最近点，秒级）：体积误差之外的第二把尺
+        self.measure_fidelity = True
 
     def as_dict(self):
         return {
@@ -30,6 +32,7 @@ class ConvertOptions:
             "参数化重建": self.parametric,
             "残差平滑角度": self.residual_patch_deg,
             "大网格自动简化": self.simplify_large,
+            "表面保真度体检": self.measure_fidelity,
         }
 
 
@@ -138,10 +141,12 @@ def convert(mesh, options=None, progress_cb=None):
                 notes = notes + ["参数化重建未命中：{}。已自动回退面拟合/缝合法。".format(reason)]
             else:
                 notes = notes + ["参数化重建未命中，已自动回退面拟合/缝合法。"]
+            reject_code = getattr(result, "reject_code", "") or ""
             result = convert_analytic(m, tolerance=opts.tolerance,
                                       progress_cb=progress_cb,
                                       residual_patch_deg=opts.residual_patch_deg)
             result.prep_notes = notes
+            result.reject_code = reject_code
             if not hasattr(result, "param_type"):
                 result.param_type = "fallback"
         else:
@@ -156,7 +161,30 @@ def convert(mesh, options=None, progress_cb=None):
         result = build_solid_from_mesh(m, tolerance=opts.tolerance, progress_cb=progress_cb)
         result.prep_notes = notes
     result.analysis = analysis
+    if getattr(opts, "measure_fidelity", True):
+        _attach_fidelity(result, m)
     return result
+
+
+def _attach_fidelity(result, mesh):
+    """给结果附上表面保真度体检数据；偏低时在 prep_notes 里明说。
+
+    只做提示，不改变采纳结论（采纳仍由体积误差与 valid 把关）——
+    体积准但表面切成台阶件，用户有权知道。
+    """
+    try:
+        from .quality import surface_deviation, low_fidelity, format_fidelity
+        fid = surface_deviation(mesh, combine_shapes(result))
+    except Exception:
+        return
+    if not fid:
+        return
+    result.fidelity = fid
+    if low_fidelity(fid):
+        notes = list(getattr(result, "prep_notes", []) or [])
+        notes.append("几何保真度偏低：{}（体积误差小不代表表面贴合，斜面/曲面处可能是台阶或近似）。"
+                     .format(format_fidelity(fid)))
+        result.prep_notes = notes
 
 
 def make_compound(*shapes):

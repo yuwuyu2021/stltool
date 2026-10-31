@@ -749,6 +749,98 @@ def test_param_fallback_reports_reason():
     assert getattr(r, "param_type", "") == "fallback", getattr(r, "param_type", "")
 
 
+def test_fidelity_metric_measures_surface():
+    """保真度体检：完全贴合的实体偏差≈0，尺寸偏 1mm 的实体偏差必须显著。"""
+    import trimesh
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    from stl_tool.quality import surface_deviation, format_fidelity, low_fidelity
+
+    mesh = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+    exact = BRepPrimAPI_MakeBox(gp_Pnt(-5, -5, -5), 10.0, 10.0, 10.0).Shape()
+    fid = surface_deviation(mesh, exact)
+    assert fid is not None, "体检应返回结果"
+    assert fid["p95_pct"] < 0.5, "完全贴合的实体 P95 应接近 0，实际 {:.2f}%".format(fid["p95_pct"])
+    assert not low_fidelity(fid), fid
+
+    wide = BRepPrimAPI_MakeBox(gp_Pnt(-5, -5, -5), 11.0, 10.0, 10.0).Shape()
+    fid2 = surface_deviation(mesh, wide)
+    assert fid2 is not None
+    assert fid2["max_pct"] > 5.0, "单侧偏 1mm（对角线的 ~5.4%）必须被抓到，实际 {:.2f}%".format(
+        fid2["max_pct"])
+    assert low_fidelity(fid2), fid2
+    assert "P95" in format_fidelity(fid2)
+    assert format_fidelity(fid2, with_p50=True).count("%") >= 3
+
+
+def test_convert_attaches_fidelity():
+    """convert 默认附带保真度数据；关掉选项则不体检。"""
+    import trimesh
+    from stl_tool.pipeline import convert, ConvertOptions
+
+    mesh = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+    opts = ConvertOptions()
+    opts.parametric = True
+    r = convert(mesh, opts)
+    assert r.has_solid()
+    fid = getattr(r, "fidelity", None)
+    assert fid is not None, "参数化命中后应带保真度数据"
+    assert fid["p95_pct"] < 0.5, fid
+
+    opts2 = ConvertOptions()
+    opts2.parametric = True
+    opts2.measure_fidelity = False
+    r2 = convert(mesh, opts2)
+    assert getattr(r2, "fidelity", None) is None, "关闭选项后不应体检"
+    assert opts2.as_dict()["表面保真度体检"] is False
+
+
+def test_layers_reject_code_reported():
+    """分层拒绝要带机器可读代码（供日志/统计归类），不只是中文文案。"""
+    from stl_tool.parametric import _detect_layers, _find_thickness_axis, _volume_approx
+
+    mesh = _trapezoid_prism_mesh()
+    lay, info = _detect_layers(mesh, _find_thickness_axis(mesh), _volume_approx(mesh),
+                               slope_max=0.30)
+    assert lay is None
+    assert info.get("reject_code") == "layers_slope", info
+
+
+def test_offorigin_primitives_keep_position():
+    """非原点零件：圆柱/回转体拟合必须保持位置（体积对≠位置对）。
+
+    曾经的 bug：轴向坐标按"过原点的轴"计算，零件一离开原点就整体平移；
+    体积校验照样通过，只有表面偏差抓得到。
+    """
+    import numpy as np
+    import trimesh
+    from stl_tool.parametric import detect_revolve
+    from stl_tool.pipeline import convert, ConvertOptions, shape_to_mesh
+    from stl_tool.quality import surface_deviation
+
+    cyl = trimesh.creation.cylinder(radius=3.0, height=8.0, sections=96)
+    cyl.apply_translation([40.0, -25.0, 12.0])
+    opts = ConvertOptions()
+    opts.parametric = True
+    r = convert(cyl, opts)
+    assert getattr(r, "param_type", "") == "cylinder", getattr(r, "param_type", "")
+    shape = [s for s, v in r.shapes if v][0]
+    sm = shape_to_mesh(shape)
+    assert np.allclose(sm.bounds, cyl.bounds, atol=0.05), (sm.bounds, cyl.bounds)
+
+    # 端部半径非 0 的回转体（平顶）也要封成平面，不能切出锥面
+    prof = np.array([[0, 0], [0.8, 0.5], [1.5, 1], [2, 2.5],
+                     [1.6, 4], [0, 4]], float) * 2.0
+    rv = trimesh.creation.revolve(prof, sections=72)
+    rv.apply_translation([30.0, 18.0, 5.0])
+    sh, info = detect_revolve(rv)
+    assert sh is not None, "回转体应被识别"
+    fid = surface_deviation(rv, sh)
+    assert fid is not None and fid["p95_pct"] < 1.5, fid
+    sm2 = shape_to_mesh(sh)
+    assert np.allclose(sm2.bounds, rv.bounds, atol=0.1), (sm2.bounds, rv.bounds)
+
+
 if __name__ == "__main__":
     test_box_convert()
     print("box ok")

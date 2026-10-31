@@ -145,6 +145,7 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
     except Exception:
         pass
     rep(100, "转换完成")
+    fid = getattr(res, "fidelity", None)
     return {
         "ok": True,
         "out_path": out,
@@ -155,8 +156,19 @@ def _proc_convert(src_file, src_dir, out_dir, schema, write_pcurves, report_queu
         "kind": kind,
         "n_new": n_new,
         "notes": list(getattr(res, "prep_notes", []) or []),
+        "fidelity": fid,
+        "fidelity_text": _fidelity_text(fid),
+        "reject_code": getattr(res, "reject_code", "") or "",
         "seconds": time.time() - t1,
     }
+
+
+def _fidelity_text(fid):
+    try:
+        from .quality import format_fidelity
+        return format_fidelity(fid)
+    except Exception:
+        return ""
 
 
 class BatchWorker(QThread):
@@ -214,6 +226,9 @@ class BatchWorker(QThread):
                     self.log_msg.emit("  重建：{} | 实体面 {} | 体积 网格 {:.3f} / STEP {:.3f}（{:+.1f}%），耗时 {:.1f}s".format(
                         res.get("kind", ""), res.get("n_new", 0), vol_m,
                         res.get("vol_step", 0.0), err, res.get("seconds", 0.0)))
+                    ftxt = res.get("fidelity_text") or ""
+                    if ftxt:
+                        self.log_msg.emit("  保真度：" + ftxt)
                     for note in res.get("notes", []) or []:
                         self.log_msg.emit("  说明：" + str(note))
                     sm = res.get("step_mesh")
